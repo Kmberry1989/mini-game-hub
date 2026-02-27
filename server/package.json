@@ -1,12 +1,12 @@
 {
   "name": "mini-game-hub-server",
+  "private": true,
   "type": "module",
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js"
   },
   "dependencies": {
-    "socket.io": "^4.7.5",
-    "cors": "^2.8.5"
+    "socket.io": "4.8.3"
   }
 }
