@@ -1,4 +1,4 @@
-export const WORLD_DEFAULT = { w: 1400, h: 900 };
+export const WORLD_DEFAULT = { w: 2800, h: 1800 };
 export const WORLD_SCALE = 0.01;
 
 export const PLAYER_SPEED = 185;

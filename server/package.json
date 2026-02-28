@@ -7,6 +7,12 @@
     "start": "node src/index.js"
   },
   "dependencies": {
-    "socket.io": "4.8.3"
+    "bcryptjs": "^2.4.3",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "livekit-server-sdk": "^2.14.0",
+    "pg": "^8.14.1",
+    "socket.io": "4.8.3",
+    "uuid": "^11.1.0"
   }
 }

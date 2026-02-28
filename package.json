@@ -2,8 +2,8 @@
   "name": "mini-game-hub",
   "private": true,
   "scripts": {
-    "dev:client": "npm --prefix client run dev",
-    "dev:server": "npm --prefix server run dev",
-    "build:client": "npm --prefix client run build"
+    "dev:client": "cd client && npm run dev",
+    "dev:server": "cd server && npm run dev",
+    "build:client": "cd client && npm run build"
   }
 }
