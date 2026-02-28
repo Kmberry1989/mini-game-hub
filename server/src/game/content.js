@@ -7,6 +7,92 @@ export const MAX_ROOM_PLAYERS = 12;
 
 export const DEFAULT_ROOM_ID = "studio-1";
 
+export const STUDIO_ZONES = [
+  {
+    id: "stage",
+    name: "Stage",
+    type: "rect",
+    miniGameId: "emote_echo_circle",
+    bounds: { xMin: 1840, xMax: 2760, yMin: 120, yMax: 720 }
+  },
+  {
+    id: "workshop",
+    name: "Workshop",
+    type: "rect",
+    miniGameId: "prop_relay_bench",
+    bounds: { xMin: 120, xMax: 980, yMin: 220, yMax: 980 }
+  },
+  {
+    id: "lounge",
+    name: "Lounge",
+    type: "rect",
+    miniGameId: null,
+    bounds: { xMin: 980, xMax: 1720, yMin: 980, yMax: 1680 }
+  },
+  {
+    id: "gallery",
+    name: "Gallery",
+    type: "rect",
+    miniGameId: null,
+    bounds: { xMin: 1840, xMax: 2760, yMin: 840, yMax: 1700 }
+  },
+  {
+    id: "walkway",
+    name: "Walkway",
+    type: "perimeter",
+    miniGameId: "glow_trail_walk",
+    bounds: { inset: 240 }
+  }
+];
+
+export const MINI_GAME_DEFS = [
+  {
+    id: "emote_echo_circle",
+    zoneId: "stage",
+    type: "social_rhythm",
+    promptEveryMs: 4000,
+    responseWindowMs: 1800,
+    promptOrder: ["wave", "heart", "sparkle", "laugh"],
+    rewardMilestones: [
+      { combo: 3, stars: 10, xp: 14 },
+      { combo: 6, stars: 14, xp: 18 },
+      { combo: 10, stars: 18, xp: 24 }
+    ]
+  },
+  {
+    id: "prop_relay_bench",
+    zoneId: "workshop",
+    type: "context_relay",
+    sequence: ["pickup", "openlid", "jump"],
+    stepWindowMs: 2400,
+    idleDecayMs: 5500,
+    rewardMilestones: [
+      { streak: 2, stars: 12, xp: 16 },
+      { streak: 4, stars: 16, xp: 22 },
+      { streak: 6, stars: 20, xp: 28 }
+    ]
+  },
+  {
+    id: "glow_trail_walk",
+    zoneId: "walkway",
+    type: "path_coop",
+    waypointRadius: 130,
+    waypoints: [
+      { x: 360, y: 300 },
+      { x: 1400, y: 260 },
+      { x: 2450, y: 320 },
+      { x: 2520, y: 900 },
+      { x: 2450, y: 1520 },
+      { x: 1400, y: 1560 },
+      { x: 360, y: 1500 },
+      { x: 290, y: 920 }
+    ],
+    happywalkEvery: 3,
+    rewardPerCompletion: { stars: 24, xp: 32 },
+    coopBonus: { minParticipants: 2, stars: 8, xp: 10 }
+  }
+];
+
 export const ALLOWED_AVATARS = new Set([
   "kyle",
   "bethany",
@@ -102,6 +188,36 @@ export const QUEST_DEFS = [
     target: 2400,
     isDaily: true,
     rewards: { stars: 30, xp: 44 }
+  },
+  {
+    id: "daily_minigame_participation",
+    key: "daily_minigame_participation",
+    title: "Join Mini-Games",
+    type: "minigame_participation",
+    target: 6,
+    config: { gameId: "any" },
+    isDaily: true,
+    rewards: { stars: 34, xp: 46 }
+  },
+  {
+    id: "daily_minigame_combo",
+    key: "daily_minigame_combo",
+    title: "Build Team Combo",
+    type: "minigame_combo",
+    target: 2,
+    config: { gameId: "emote_echo_circle", minCombo: 3 },
+    isDaily: true,
+    rewards: { stars: 38, xp: 50 }
+  },
+  {
+    id: "daily_minigame_completion",
+    key: "daily_minigame_completion",
+    title: "Finish Co-op Loops",
+    type: "minigame_completion",
+    target: 2,
+    config: { gameId: "any" },
+    isDaily: true,
+    rewards: { stars: 40, xp: 56 }
   }
 ];
 
@@ -182,4 +298,38 @@ export function getQuestDefById(questId) {
 
 export function getUnlockDefById(unlockId) {
   return UNLOCK_DEFS.find((unlock) => unlock.id === unlockId) || null;
+}
+
+export function getZoneById(zoneId) {
+  return STUDIO_ZONES.find((zone) => zone.id === zoneId) || null;
+}
+
+export function getMiniGameDefById(miniGameId) {
+  return MINI_GAME_DEFS.find((game) => game.id === miniGameId) || null;
+}
+
+export function getZoneIdAtPosition(x, y) {
+  for (const zone of STUDIO_ZONES) {
+    if (zone.type === "rect") {
+      const bounds = zone.bounds || {};
+      if (x >= bounds.xMin && x <= bounds.xMax && y >= bounds.yMin && y <= bounds.yMax) {
+        return zone.id;
+      }
+      continue;
+    }
+
+    if (zone.type === "perimeter") {
+      const inset = Number(zone.bounds?.inset || 240);
+      const inPerimeter =
+        x <= inset ||
+        y <= inset ||
+        x >= WORLD.w - inset ||
+        y >= WORLD.h - inset;
+      if (inPerimeter) {
+        return zone.id;
+      }
+    }
+  }
+
+  return null;
 }

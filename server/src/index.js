@@ -14,13 +14,16 @@ import {
   DEFAULT_AVATAR,
   DEFAULT_ROOM_ID,
   MAX_ROOM_PLAYERS,
+  MINI_GAME_DEFS,
   PLAYER_PADDING,
   PLAYER_SPEED,
+  STUDIO_ZONES,
   TICK_MS,
   UNLOCK_TRACK,
   WORLD,
   dayStamp,
   getActiveQuestDefs,
+  getZoneIdAtPosition,
   getUnlockDefById
 } from "./game/content.js";
 
@@ -63,6 +66,8 @@ app.use(express.json({ limit: "256kb" }));
 const allowedOrigins = new Set([
   "http://localhost:5173",
   "http://127.0.0.1:5173",
+  "http://localhost:5174",
+  "http://127.0.0.1:5174",
   "http://localhost:4173",
   "http://127.0.0.1:4173"
 ]);
@@ -94,6 +99,7 @@ const io = new Server(httpServer, {
 
 const players = new Map();
 const userSocketIds = new Map();
+const roomMiniGames = new Map();
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -418,6 +424,31 @@ function applyQuestDelta(userId, questType, delta, options = {}) {
       }
     }
 
+    if (questType === "minigame_participation") {
+      const expectedGameId = quest.config?.gameId;
+      if (expectedGameId && expectedGameId !== "any" && expectedGameId !== options.gameId) {
+        continue;
+      }
+    }
+
+    if (questType === "minigame_combo") {
+      const expectedGameId = quest.config?.gameId;
+      const minCombo = Number(quest.config?.minCombo || 0);
+      if (expectedGameId && expectedGameId !== "any" && expectedGameId !== options.gameId) {
+        continue;
+      }
+      if (minCombo > 0 && Number(options.combo || 0) < minCombo) {
+        continue;
+      }
+    }
+
+    if (questType === "minigame_completion") {
+      const expectedGameId = quest.config?.gameId;
+      if (expectedGameId && expectedGameId !== "any" && expectedGameId !== options.gameId) {
+        continue;
+      }
+    }
+
     const row = store.findQuestState(userId, quest.id);
     if (!row || row.status === "completed" || row.status === "claimed") {
       continue;
@@ -459,7 +490,8 @@ function toPublicPlayer(player) {
     y: player.y,
     vx: player.vx,
     vy: player.vy,
-    anim: player.anim
+    anim: player.anim,
+    zoneId: player.zoneId || null
   };
 }
 
@@ -493,6 +525,514 @@ function unregisterSocketForUser(userId, socketId) {
 
 function countPlayersInRoom(roomId) {
   return listPlayersByRoom(roomId).length;
+}
+
+function getPublicZones() {
+  return STUDIO_ZONES.map((zone) => ({
+    id: zone.id,
+    name: zone.name,
+    type: zone.type,
+    miniGameId: zone.miniGameId || null,
+    bounds: zone.bounds
+  }));
+}
+
+function createMiniGameRuntime(gameDef, now) {
+  if (gameDef.id === "emote_echo_circle") {
+    return {
+      id: gameDef.id,
+      zoneId: gameDef.zoneId,
+      phase: "active",
+      promptIndex: 0,
+      prompt: gameDef.promptOrder?.[0] || "wave",
+      combo: 0,
+      progress: 0,
+      participants: new Set(),
+      responded: new Set(),
+      promptExpiresAt: now + Number(gameDef.responseWindowMs || 1800),
+      nextPromptAt: now + Number(gameDef.promptEveryMs || 4000),
+      cycle: 1,
+      awardedMilestones: new Set()
+    };
+  }
+
+  if (gameDef.id === "prop_relay_bench") {
+    return {
+      id: gameDef.id,
+      zoneId: gameDef.zoneId,
+      phase: "active",
+      promptIndex: 0,
+      prompt: gameDef.sequence?.[0] || "pickup",
+      streak: 0,
+      combo: 0,
+      progress: 0,
+      participants: new Set(),
+      deadlineAt: now + Number(gameDef.stepWindowMs || 2400),
+      lastSuccessAt: now,
+      cycle: 1,
+      awardedMilestones: new Set()
+    };
+  }
+
+  if (gameDef.id === "glow_trail_walk") {
+    return {
+      id: gameDef.id,
+      zoneId: gameDef.zoneId,
+      phase: "active",
+      prompt: "reach_waypoint",
+      combo: 0,
+      progress: 0,
+      participants: new Set(),
+      waypointIndex: 0,
+      requiresHappywalk: false,
+      cycle: 1,
+      completionCount: 0,
+      touchedThisCycle: new Set()
+    };
+  }
+
+  return {
+    id: gameDef.id,
+    zoneId: gameDef.zoneId,
+    phase: "active",
+    prompt: null,
+    combo: 0,
+    progress: 0,
+    participants: new Set(),
+    cycle: 1
+  };
+}
+
+function createRoomMiniGameState(now = Date.now()) {
+  const miniGames = new Map();
+  for (const gameDef of MINI_GAME_DEFS) {
+    miniGames.set(gameDef.id, createMiniGameRuntime(gameDef, now));
+  }
+
+  return {
+    miniGames,
+    lastZonePresenceHash: new Map()
+  };
+}
+
+function ensureRoomMiniGameState(roomId, now = Date.now()) {
+  if (!roomMiniGames.has(roomId)) {
+    roomMiniGames.set(roomId, createRoomMiniGameState(now));
+  }
+  return roomMiniGames.get(roomId);
+}
+
+function toPublicMiniGameState(gameState) {
+  const participantIds = Array.from(gameState.participants || []);
+
+  return {
+    id: gameState.id,
+    zoneId: gameState.zoneId,
+    phase: gameState.phase || "active",
+    prompt: gameState.prompt || null,
+    combo: Number(gameState.combo || 0),
+    progress: Number(gameState.progress || 0),
+    participants: participantIds,
+    cycle: Number(gameState.cycle || 1),
+    waypointIndex: Number(gameState.waypointIndex || 0),
+    requiresHappywalk: Boolean(gameState.requiresHappywalk)
+  };
+}
+
+function listPublicMiniGamesForRoom(roomId, now = Date.now()) {
+  const roomState = ensureRoomMiniGameState(roomId, now);
+  return Array.from(roomState.miniGames.values()).map(toPublicMiniGameState);
+}
+
+function awardMiniGameReward(player, gameId, sourceRef, stars, xp) {
+  if (!player?.userId) {
+    return;
+  }
+
+  const grantKey = `minigame:${gameId}:${sourceRef}`;
+  if (!store.rememberGrantKey(player.userId, grantKey)) {
+    return;
+  }
+
+  let balance = null;
+
+  if (FEATURES.economy_v1 && Number(stars) > 0) {
+    const result = store.appendCurrencyLedger({
+      userId: player.userId,
+      delta: Number(stars),
+      source: "minigame",
+      sourceRef: `${gameId}:${sourceRef}`
+    });
+    if (result) {
+      balance = result.balance;
+      emitToUser(player.userId, "currency_grant", {
+        amount: Number(stars),
+        source: "minigame",
+        balance: result.balance
+      });
+    }
+  }
+
+  if (Number(xp) > 0) {
+    store.addXp(player.userId, Number(xp));
+  }
+
+  applyUnlockTrackRewards(player.userId);
+  const profile = store.getProfileByUserId(player.userId);
+
+  emitToUser(player.userId, "minigame_reward", {
+    id: gameId,
+    playerId: player.id,
+    stars: Number(stars) || 0,
+    xp: Number(xp) || 0,
+    sourceRef,
+    balance: Number.isFinite(balance) ? balance : profile?.starsBalance ?? null,
+    level: profile?.level ?? null,
+    totalXp: profile?.xpTotal ?? null
+  });
+}
+
+function updateRoomZonePresence(roomId, roomPlayers) {
+  const roomState = ensureRoomMiniGameState(roomId, Date.now());
+  const currentPresence = new Map();
+
+  for (const zone of STUDIO_ZONES) {
+    currentPresence.set(zone.id, []);
+  }
+
+  for (const player of roomPlayers) {
+    const zoneId = getZoneIdAtPosition(player.x, player.y);
+    player.zoneId = zoneId;
+    if (zoneId && currentPresence.has(zoneId)) {
+      currentPresence.get(zoneId).push(player.id);
+    }
+  }
+
+  for (const [zoneId, ids] of currentPresence.entries()) {
+    ids.sort();
+    const hash = ids.join("|");
+    const previousHash = roomState.lastZonePresenceHash.get(zoneId) || "";
+    if (hash !== previousHash) {
+      roomState.lastZonePresenceHash.set(zoneId, hash);
+      io.to(roomId).emit("zone_presence", {
+        zoneId,
+        players: ids
+      });
+    }
+  }
+}
+
+function handleEmoteEchoAction(roomId, gameDef, gameState, player, action, now) {
+  if (player.zoneId !== gameDef.zoneId) {
+    return false;
+  }
+
+  if (now > gameState.promptExpiresAt || action !== gameState.prompt) {
+    io.to(roomId).emit("minigame_action_result", {
+      id: gameDef.id,
+      playerId: player.id,
+      action,
+      success: false,
+      scoreDelta: 0,
+      combo: gameState.combo
+    });
+    return true;
+  }
+
+  if (gameState.responded.has(player.id)) {
+    return true;
+  }
+
+  gameState.responded.add(player.id);
+  gameState.participants.add(player.id);
+  gameState.combo += 1;
+  gameState.progress = gameState.responded.size;
+
+  io.to(roomId).emit("minigame_action_result", {
+    id: gameDef.id,
+    playerId: player.id,
+    action,
+    success: true,
+    scoreDelta: 1,
+    combo: gameState.combo
+  });
+
+  applyQuestDelta(player.userId, "minigame_participation", 1, { gameId: gameDef.id });
+
+  for (const milestone of gameDef.rewardMilestones || []) {
+    const marker = Number(milestone.combo || 0);
+    if (!marker || gameState.combo < marker || gameState.awardedMilestones.has(marker)) {
+      continue;
+    }
+
+    gameState.awardedMilestones.add(marker);
+    applyQuestDelta(player.userId, "minigame_combo", 1, { gameId: gameDef.id, combo: marker });
+
+    const rewardPlayers = listPlayersByRoom(roomId).filter((entry) => entry.zoneId === gameDef.zoneId);
+    for (const rewardPlayer of rewardPlayers) {
+      awardMiniGameReward(
+        rewardPlayer,
+        gameDef.id,
+        `cycle:${gameState.cycle}:combo:${marker}:player:${rewardPlayer.id}`,
+        milestone.stars,
+        milestone.xp
+      );
+    }
+  }
+
+  return true;
+}
+
+function handlePropRelayAction(roomId, gameDef, gameState, player, action, now) {
+  if (player.zoneId !== gameDef.zoneId) {
+    return false;
+  }
+
+  const sequence = gameDef.sequence || [];
+  const expected = sequence[gameState.promptIndex] || sequence[0] || "pickup";
+
+  if (now > gameState.deadlineAt || action !== expected) {
+    gameState.streak = Math.max(0, gameState.streak - 1);
+    gameState.combo = gameState.streak;
+    gameState.promptIndex = 0;
+    gameState.prompt = sequence[0] || "pickup";
+    gameState.progress = 0;
+    gameState.deadlineAt = now + Number(gameDef.stepWindowMs || 2400);
+
+    io.to(roomId).emit("minigame_action_result", {
+      id: gameDef.id,
+      playerId: player.id,
+      action,
+      success: false,
+      scoreDelta: 0,
+      combo: gameState.combo
+    });
+
+    return true;
+  }
+
+  gameState.participants.add(player.id);
+  gameState.lastSuccessAt = now;
+  gameState.promptIndex += 1;
+  gameState.progress = gameState.promptIndex / Math.max(1, sequence.length);
+  gameState.deadlineAt = now + Number(gameDef.stepWindowMs || 2400);
+
+  let scoreDelta = 1;
+  if (gameState.promptIndex >= sequence.length) {
+    gameState.promptIndex = 0;
+    gameState.progress = 1;
+    gameState.cycle += 1;
+    gameState.streak += 1;
+    gameState.combo = gameState.streak;
+    scoreDelta = 2;
+    applyQuestDelta(player.userId, "minigame_completion", 1, { gameId: gameDef.id });
+    applyQuestDelta(player.userId, "minigame_combo", 1, { gameId: gameDef.id, combo: gameState.streak });
+
+    for (const milestone of gameDef.rewardMilestones || []) {
+      const marker = Number(milestone.streak || 0);
+      if (!marker || gameState.streak < marker || gameState.awardedMilestones.has(marker)) {
+        continue;
+      }
+
+      gameState.awardedMilestones.add(marker);
+      const rewardPlayers = listPlayersByRoom(roomId).filter((entry) => entry.zoneId === gameDef.zoneId);
+      for (const rewardPlayer of rewardPlayers) {
+        awardMiniGameReward(
+          rewardPlayer,
+          gameDef.id,
+          `cycle:${gameState.cycle}:streak:${marker}:player:${rewardPlayer.id}`,
+          milestone.stars,
+          milestone.xp
+        );
+      }
+    }
+  }
+
+  gameState.prompt = sequence[gameState.promptIndex] || sequence[0] || "pickup";
+
+  io.to(roomId).emit("minigame_action_result", {
+    id: gameDef.id,
+    playerId: player.id,
+    action,
+    success: true,
+    scoreDelta,
+    combo: gameState.combo
+  });
+
+  applyQuestDelta(player.userId, "minigame_participation", 1, { gameId: gameDef.id });
+  return true;
+}
+
+function handleGlowTrailAction(roomId, gameDef, gameState, player, action) {
+  if (player.zoneId !== gameDef.zoneId) {
+    return false;
+  }
+
+  if (action !== "happywalk" || !gameState.requiresHappywalk) {
+    return false;
+  }
+
+  gameState.requiresHappywalk = false;
+  gameState.phase = "active";
+  gameState.combo += 1;
+  gameState.participants.add(player.id);
+
+  io.to(roomId).emit("minigame_action_result", {
+    id: gameDef.id,
+    playerId: player.id,
+    action,
+    success: true,
+    scoreDelta: 1,
+    combo: gameState.combo
+  });
+
+  applyQuestDelta(player.userId, "minigame_participation", 1, { gameId: gameDef.id });
+  return true;
+}
+
+function handleMiniGameAction(player, action, now) {
+  const roomState = ensureRoomMiniGameState(player.roomId, now);
+
+  for (const gameDef of MINI_GAME_DEFS) {
+    const gameState = roomState.miniGames.get(gameDef.id);
+    if (!gameState) {
+      continue;
+    }
+
+    if (gameDef.id === "emote_echo_circle" && handleEmoteEchoAction(player.roomId, gameDef, gameState, player, action, now)) {
+      return;
+    }
+
+    if (gameDef.id === "prop_relay_bench" && handlePropRelayAction(player.roomId, gameDef, gameState, player, action, now)) {
+      return;
+    }
+
+    if (gameDef.id === "glow_trail_walk" && handleGlowTrailAction(player.roomId, gameDef, gameState, player, action)) {
+      return;
+    }
+  }
+}
+
+function stepMiniGamesForRoom(roomId, roomPlayers, now) {
+  const roomState = ensureRoomMiniGameState(roomId, now);
+
+  for (const gameDef of MINI_GAME_DEFS) {
+    const gameState = roomState.miniGames.get(gameDef.id);
+    if (!gameState) {
+      continue;
+    }
+
+    const zonePlayers = roomPlayers.filter((player) => player.zoneId === gameDef.zoneId);
+    gameState.participants = new Set(zonePlayers.map((player) => player.id));
+
+    if (gameDef.id === "emote_echo_circle") {
+      if (now > gameState.promptExpiresAt && gameState.responded.size === 0) {
+        gameState.combo = Math.max(0, gameState.combo - 1);
+      }
+
+      if (now >= gameState.nextPromptAt) {
+        gameState.promptIndex = (gameState.promptIndex + 1) % Math.max(1, gameDef.promptOrder?.length || 1);
+        gameState.prompt = gameDef.promptOrder?.[gameState.promptIndex] || "wave";
+        gameState.responded = new Set();
+        gameState.promptExpiresAt = now + Number(gameDef.responseWindowMs || 1800);
+        gameState.nextPromptAt = now + Number(gameDef.promptEveryMs || 4000);
+        gameState.cycle += 1;
+        gameState.awardedMilestones = new Set();
+      }
+
+      gameState.phase = now <= gameState.promptExpiresAt ? "prompt" : "cooldown";
+      gameState.progress = zonePlayers.length ? gameState.responded.size / zonePlayers.length : 0;
+    }
+
+    if (gameDef.id === "prop_relay_bench") {
+      const sequence = gameDef.sequence || [];
+      if (now > gameState.deadlineAt) {
+        gameState.streak = Math.max(0, gameState.streak - 1);
+        gameState.combo = gameState.streak;
+        gameState.promptIndex = 0;
+        gameState.progress = 0;
+        gameState.deadlineAt = now + Number(gameDef.stepWindowMs || 2400);
+      }
+
+      if (now - gameState.lastSuccessAt > Number(gameDef.idleDecayMs || 5500)) {
+        gameState.streak = Math.max(0, gameState.streak - 1);
+        gameState.combo = gameState.streak;
+        gameState.lastSuccessAt = now;
+      }
+
+      gameState.prompt = sequence[gameState.promptIndex] || sequence[0] || "pickup";
+      gameState.phase = "active";
+    }
+
+    if (gameDef.id === "glow_trail_walk") {
+      const waypoints = gameDef.waypoints || [];
+      const waypoint = waypoints[gameState.waypointIndex];
+
+      if (gameState.requiresHappywalk) {
+        gameState.phase = "waiting_happywalk";
+      } else if (waypoint) {
+        for (const zonePlayer of zonePlayers) {
+          const distance = Math.hypot(zonePlayer.x - waypoint.x, zonePlayer.y - waypoint.y);
+          if (distance > Number(gameDef.waypointRadius || 130)) {
+            continue;
+          }
+
+          gameState.touchedThisCycle.add(zonePlayer.id);
+          gameState.waypointIndex += 1;
+          gameState.phase = "active";
+
+          if (zonePlayer.userId) {
+            applyQuestDelta(zonePlayer.userId, "minigame_participation", 1, { gameId: gameDef.id });
+          }
+
+          if (
+            Number(gameDef.happywalkEvery || 0) > 0 &&
+            gameState.waypointIndex < waypoints.length &&
+            gameState.waypointIndex % Number(gameDef.happywalkEvery) === 0
+          ) {
+            gameState.requiresHappywalk = true;
+          }
+
+          if (gameState.waypointIndex >= waypoints.length) {
+            gameState.completionCount += 1;
+            gameState.cycle += 1;
+            gameState.waypointIndex = 0;
+            gameState.requiresHappywalk = false;
+            gameState.phase = "complete";
+            gameState.combo += 1;
+
+            const rewardParticipants = roomPlayers.filter((entry) => gameState.touchedThisCycle.has(entry.id));
+            for (const rewardPlayer of rewardParticipants) {
+              let stars = Number(gameDef.rewardPerCompletion?.stars || 0);
+              let xp = Number(gameDef.rewardPerCompletion?.xp || 0);
+              if (rewardParticipants.length >= Number(gameDef.coopBonus?.minParticipants || 2)) {
+                stars += Number(gameDef.coopBonus?.stars || 0);
+                xp += Number(gameDef.coopBonus?.xp || 0);
+              }
+
+              awardMiniGameReward(
+                rewardPlayer,
+                gameDef.id,
+                `cycle:${gameState.cycle}:completion:${gameState.completionCount}:player:${rewardPlayer.id}`,
+                stars,
+                xp
+              );
+              applyQuestDelta(rewardPlayer.userId, "minigame_completion", 1, { gameId: gameDef.id });
+            }
+
+            gameState.touchedThisCycle = new Set();
+          }
+
+          break;
+        }
+      }
+
+      gameState.progress = waypoints.length ? gameState.waypointIndex / waypoints.length : 0;
+      gameState.prompt = gameState.requiresHappywalk ? "happywalk" : "reach_waypoint";
+    }
+
+    io.to(roomId).emit("minigame_state", toPublicMiniGameState(gameState));
+  }
 }
 
 app.get("/api/health", (_req, res) => {
@@ -792,11 +1332,15 @@ io.on("connection", (socket) => {
         muted: false,
         deafened: false,
         pushToTalk: true
-      }
+      },
+      zoneId: null
     };
+
+    player.zoneId = getZoneIdAtPosition(player.x, player.y);
 
     players.set(socket.id, player);
     socket.join(roomId);
+    ensureRoomMiniGameState(roomId, now);
 
     if (player.userId) {
       registerSocketForUser(player.userId, socket.id);
@@ -811,6 +1355,8 @@ io.on("connection", (socket) => {
       roomId,
       world: WORLD,
       players: roomPlayers,
+      zones: getPublicZones(),
+      miniGames: listPublicMiniGamesForRoom(roomId, now),
       profile:
         authenticatedUser && authenticatedProfile
           ? summarizeProfile(authenticatedUser, authenticatedProfile)
@@ -822,6 +1368,8 @@ io.on("connection", (socket) => {
       quests: authenticatedUser ? ensureActiveQuestsForUser(authenticatedUser.id, new Date()) : [],
       roomVoiceEnabled
     });
+
+    updateRoomZonePresence(roomId, listPlayersByRoom(roomId));
 
     socket.to(roomId).emit("player_joined", toPublicPlayer(player));
   });
@@ -849,6 +1397,8 @@ io.on("connection", (socket) => {
       type,
       ts: Date.now()
     });
+
+    handleMiniGameAction(player, type, Date.now());
 
     if (!player.userId) {
       return;
@@ -906,10 +1456,15 @@ io.on("connection", (socket) => {
     }
 
     players.delete(socket.id);
+
+    if (player && countPlayersInRoom(player.roomId) === 0) {
+      roomMiniGames.delete(player.roomId);
+    }
   });
 });
 
 setInterval(() => {
+  const now = Date.now();
   const dt = TICK_MS / 1000;
 
   for (const player of players.values()) {
@@ -950,9 +1505,19 @@ setInterval(() => {
 
   const roomIds = new Set(Array.from(players.values()).map((player) => player.roomId));
   for (const roomId of roomIds) {
+    const roomPlayers = listPlayersByRoom(roomId);
+    updateRoomZonePresence(roomId, roomPlayers);
+    stepMiniGamesForRoom(roomId, roomPlayers, now);
+
     io.to(roomId).emit("state", {
-      players: listPlayersByRoom(roomId).map(toPublicPlayer)
+      players: roomPlayers.map(toPublicPlayer)
     });
+  }
+
+  for (const roomId of Array.from(roomMiniGames.keys())) {
+    if (!roomIds.has(roomId)) {
+      roomMiniGames.delete(roomId);
+    }
   }
 }, TICK_MS);
 

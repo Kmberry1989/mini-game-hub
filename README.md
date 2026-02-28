@@ -40,6 +40,9 @@ npm run dev
 - auth/profile/quest backend (alpha slice)
 - progression + quest UI overlays
 - voice signaling/token contract (LiveKit-ready)
+- one-room social mini-game zones (stage/workshop/lounge/gallery/walkway)
+- server-authoritative mini-game loops (emote echo, prop relay, glow trail)
+- adaptive mobile lighting presets with in-game override
 
 ## Alpha Server Environment
 

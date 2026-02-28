@@ -314,3 +314,69 @@ Original prompt: Create a plan to... develop this game further
 - Remaining TODOs
   - Implement per-avatar clip compatibility matrix (server/content + client) so unstable clips are auto-fallbacked per character instead of relying only on root clamp.
   - Add an explicit automated smoke step that triggers at least one non-idle emote clip per run and validates pose constraints in `render_game_to_text` (e.g., no NaN, no extreme root tilt markers).
+
+## 2026-02-28 - Mini-games + studio zoning + adaptive lighting
+- Implemented server-authoritative social mini-game runtime with one-room zones.
+- Added zone and mini-game content definitions in `server/src/game/content.js`:
+  - `STUDIO_ZONES` (stage/workshop/lounge/gallery/walkway)
+  - `MINI_GAME_DEFS` for `emote_echo_circle`, `prop_relay_bench`, and `glow_trail_walk`
+  - new daily quest types: `minigame_participation`, `minigame_combo`, `minigame_completion`.
+- Extended `server/src/index.js`:
+  - `welcome` now includes `zones` and `miniGames`
+  - `state.players[]` now includes `zoneId`
+  - new socket events emitted: `minigame_state`, `minigame_action_result`, `minigame_reward`, `zone_presence`
+  - added room mini-game runtime, zone presence tracking, per-room cleanup, and idempotent mini-game rewards.
+- Added client zone/lighting helper module: `client/src/game/zones.js`.
+- Extended `client/src/App.jsx`:
+  - new client state for zones, zone presence, mini-game states, and lighting presets (`low|medium|high`)
+  - auto lighting preset selection + startup FPS downshift in auto mode
+  - manual lighting override controls in HUD
+  - scene now uses zone-aware world dressing and active mini-game lighting accents
+  - `render_game_to_text()` now includes `miniGames`, `zones`, and `lightingPreset`.
+
+### Verification
+- Server syntax: `node --check server/src/index.js` passes.
+- Client build: `npm run build:client` passes.
+- Playwright smoke (isolated ports 3010/5176):
+  - `/tmp/mini-game-hub-zones-smoke-2`
+  - `/tmp/mini-game-hub-zones-smoke-3`
+  - no `errors-*.json` artifacts.
+- Text-state snapshots confirm new fields are present and populated:
+  - `miniGames[]` (with prompt/combo/progress)
+  - `zones[]`
+  - `lightingPreset`.
+
+### Remaining TODOs / follow-up
+- Add richer zone props/decals/labels (current pass is geometry-first and marker-led).
+- Add stricter automated smoke that drives guaranteed zone-entry + mini-game success paths (current deterministic script validates event presence/state shape and gameplay stability, but not every reward path in one run).
+- Tune mini-game cadence and reward values with multiplayer QA.
+
+## 2026-02-28 - Mini-game visual pass follow-up (avatar stability)
+- Fixed oversized-avatar regression introduced by prior scaling experiments:
+  - `TARGET_AVATAR_HEIGHT` raised to `1.06` and in-world multiplier normalized to `1`.
+  - Added hard scale ceiling `MAX_AVATAR_SCALE = 24`.
+  - Added post-fit extent guard in `fitModelToTargetExtent(...)` to re-correct extreme under/oversize mesh bounds.
+- Added runtime FBX compatibility fallback path for current character roster:
+  - Introduced high-risk clip blocklist (`heart`, `sparkle`, `laugh`, `jump`, `pickup`, `openlid`, `sittingvictory`, `happywalk`) for rig playback.
+  - These actions still resolve to the same gameplay animation states but now use the procedural fallback path to prevent collapse/twist.
+- Improved avatar instancing wiring:
+  - `AvatarEntity` now receives `avatarId` explicitly and uses avatar-aware clip compatibility selection.
+- Reduced zone/readout mismatch on local player:
+  - Local simulation no longer overwrites an authoritative non-null `zoneId` each frame.
+
+### Verification (post-fix)
+- Build:
+  - `npm run build:client` passes.
+- Playwright skill client runs:
+  - idle baseline: `/tmp/mini-game-hub-zones-idle-2`
+  - zone entry + echo activity: `/tmp/mini-game-hub-zones-verify-zone`
+  - jump/happywalk stress path: `/tmp/mini-game-hub-zones-verify-jumphappy`
+  - no `errors-*.json` artifacts in these runs.
+- State checks confirm:
+  - `zones`, `miniGames`, and `lightingPreset` remain present in `render_game_to_text`.
+  - click-to-move path sets `moveTarget` and drives stage entry (`zones.stage.players` includes local id).
+  - active mini-game HUD and zone lighting continue updating during movement/action bursts.
+
+### Remaining TODOs / follow-up
+- Finish per-avatar clip compatibility matrix (instead of current conservative runtime blocklist).
+- Add deterministic smoke sequence that forces successful `emote_echo_circle`, `prop_relay_bench`, and `glow_trail_walk` reward grants in one scripted run.

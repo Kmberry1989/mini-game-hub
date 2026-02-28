@@ -17,6 +17,13 @@ import {
 import { CONTEXT_ACTION_ORDER, EMOTE_LABELS, EMOTE_ORDER, isValidEmote } from "./game/emotes";
 import { clamp, lerp, normalizeAxis } from "./game/math";
 import {
+  DEFAULT_ZONE_DEFS,
+  LIGHTING_PRESET_ORDER,
+  getZoneIdAtPosition,
+  normalizeLightingPreset,
+  selectInitialLightingPreset
+} from "./game/zones";
+import {
   clearStoredSession,
   fetchProfile,
   fetchVoiceToken,
@@ -110,15 +117,39 @@ const ACTION_DURATION_MS = {
 };
 
 const MODEL_YAW_OFFSET = 0;
-const TARGET_AVATAR_HEIGHT = 0.16;
-const IN_WORLD_AVATAR_SCALE_MULTIPLIER = 40;
+const TARGET_AVATAR_HEIGHT = 1.06;
+const IN_WORLD_AVATAR_SCALE_MULTIPLIER = 1;
 const MIN_AVATAR_EXTENT = 0.001;
 const MIN_AVATAR_SCALE = 0.01;
+const MAX_AVATAR_SCALE = 24;
+const HIGH_RISK_FBX_CLIP_KEYS = new Set(["heart", "sparkle", "laugh", "jump", "pickup", "openlid", "sittingvictory", "happywalk"]);
 const SAFE_FBX_CLIP_KEYS = new Set(Object.keys(ANIMATION_URLS));
 const LOOPING_ANIMATION_KEYS = new Set(["idle", "walk", "run", "happywalk", "bored", "yawn"]);
 const ROOT_MOTION_BONE = "mixamorigHips";
 const CLICK_MOVE_STOP_RADIUS = 22;
 const MAX_ROOT_TILT_RADIANS = Math.PI * 0.36;
+
+function resolveCompatibleClipKeysForAvatar(avatarId) {
+  const normalized = normalizeCharacterId(avatarId);
+  const blocked = new Set();
+
+  // Most current roster avatars are stable on locomotion/emote clips but can collapse on contextual stunts.
+  // Keep those actions procedural until per-avatar retarget maps are finished.
+  if (normalized) {
+    for (const key of HIGH_RISK_FBX_CLIP_KEYS) {
+      blocked.add(key);
+    }
+  }
+
+  const compatible = new Set();
+  for (const key of SAFE_FBX_CLIP_KEYS) {
+    if (!blocked.has(key)) {
+      compatible.add(key);
+    }
+  }
+
+  return compatible;
+}
 
 function createEmptyActionsMap() {
   return {
@@ -309,7 +340,8 @@ function createPlayerState(input, world) {
     emoteUntil: 0,
     activeStyle: null,
     idleForMs: 0,
-    lastStateAt: performance.now()
+    lastStateAt: performance.now(),
+    zoneId: typeof input?.zoneId === "string" ? input.zoneId : null
   };
 }
 
@@ -491,10 +523,21 @@ function fitModelToTargetExtent(modelRoot, targetExtent) {
   const baseSize = new THREE.Vector3();
   baseBounds.getSize(baseSize);
   const measuredExtent = Math.max(baseSize.x, baseSize.y, baseSize.z, MIN_AVATAR_EXTENT);
-  const fitScale = THREE.MathUtils.clamp(targetExtent / measuredExtent, MIN_AVATAR_SCALE, 180);
+  const fitScale = THREE.MathUtils.clamp(targetExtent / measuredExtent, MIN_AVATAR_SCALE, MAX_AVATAR_SCALE);
   modelRoot.scale.setScalar(fitScale);
 
-  const fittedBounds = getRenderableBounds(modelRoot);
+  let fittedBounds = getRenderableBounds(modelRoot);
+  const fittedSize = new THREE.Vector3();
+  fittedBounds.getSize(fittedSize);
+  const fittedExtent = Math.max(fittedSize.x, fittedSize.y, fittedSize.z, MIN_AVATAR_EXTENT);
+
+  // Final guardrail against oversized/tiny render bounds from mixed rig import scales.
+  if (fittedExtent > targetExtent * 1.25 || fittedExtent < targetExtent * 0.35) {
+    const correction = THREE.MathUtils.clamp(targetExtent / fittedExtent, 0.2, 5);
+    modelRoot.scale.multiplyScalar(correction);
+    fittedBounds = getRenderableBounds(modelRoot);
+  }
+
   modelRoot.position.y -= fittedBounds.min.y;
 }
 
@@ -566,71 +609,240 @@ function applyProceduralPose(modelRoot, desiredAnimation, speed, timeSeconds, al
   modelRoot.scale.setScalar(THREE.MathUtils.lerp(modelRoot.scale.x, scale, alpha));
 }
 
-function StudioEnvironment({ world }) {
+const ZONE_COLORS = {
+  stage: "#4f2744",
+  workshop: "#453329",
+  lounge: "#2f2f4f",
+  gallery: "#3f2b52",
+  walkway: "#2f2144",
+  default: "#3b2c4f"
+};
+
+const MINI_GAME_LABELS = {
+  emote_echo_circle: "Echo",
+  prop_relay_bench: "Relay",
+  glow_trail_walk: "Trail"
+};
+
+function getZoneCenter(zone, world) {
+  if (zone.type === "rect") {
+    const bounds = zone.bounds || {};
+    const cx = (Number(bounds.xMin || 0) + Number(bounds.xMax || world.w)) / 2;
+    const cy = (Number(bounds.yMin || 0) + Number(bounds.yMax || world.h)) / 2;
+    return { x: cx, y: cy };
+  }
+
+  const inset = Number(zone.bounds?.inset || 240);
+  return { x: world.w - inset, y: world.h - inset };
+}
+
+function ZoneAccentLight({ position, color, baseIntensity, distance }) {
+  const ref = useRef(null);
+  useFrame(({ clock }) => {
+    if (ref.current) {
+      ref.current.intensity = baseIntensity * (0.82 + Math.sin(clock.elapsedTime * 3.2) * 0.18);
+    }
+  });
+
+  return <pointLight ref={ref} position={position} color={color} intensity={baseIntensity} distance={distance} decay={2} />;
+}
+
+function ZonePulseMarker({ world, zone, active, color }) {
+  const groupRef = useRef(null);
+  const center = getZoneCenter(zone, world);
+  const centerScene = worldToScenePosition(world, center.x, center.y);
+  const baseRadius = zone.type === "rect" ? 0.32 : 0.28;
+
+  useFrame(({ clock }) => {
+    if (!groupRef.current) {
+      return;
+    }
+    const t = clock.elapsedTime;
+    const pulse = active ? 1 + Math.sin(t * 3.4) * 0.18 : 1;
+    groupRef.current.scale.setScalar(pulse);
+  });
+
+  return (
+    <group ref={groupRef} position={[centerScene.x, 0.06, centerScene.z]}>
+      <mesh rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[baseRadius, baseRadius + 0.055, 26]} />
+        <meshBasicMaterial color={color} transparent opacity={active ? 0.82 : 0.34} />
+      </mesh>
+      <mesh position={[0, 0.06, 0]}>
+        <sphereGeometry args={[0.04, 10, 10]} />
+        <meshStandardMaterial color={active ? "#ffe5bc" : "#cbc2dd"} emissive={color} emissiveIntensity={0.45} />
+      </mesh>
+    </group>
+  );
+}
+
+function StudioEnvironment({ world, zones, miniGames, lightingPreset }) {
   const width = world.w * WORLD_SCALE;
   const height = world.h * WORLD_SCALE;
+  const miniGameByZone = useMemo(() => {
+    const map = new Map();
+    for (const state of miniGames || []) {
+      map.set(state.zoneId, state);
+    }
+    return map;
+  }, [miniGames]);
+  const showExtraProps = lightingPreset !== "low";
 
   return (
     <>
       <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
         <planeGeometry args={[width + 2.2, height + 2.2]} />
-        <meshStandardMaterial color="#251d33" roughness={0.96} metalness={0.05} />
+        <meshStandardMaterial color="#21162f" roughness={0.94} metalness={0.05} />
       </mesh>
 
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.01, 0]} receiveShadow>
         <planeGeometry args={[width * 0.72, height * 0.72]} />
-        <meshStandardMaterial color="#352848" roughness={0.9} metalness={0.08} />
+        <meshStandardMaterial color="#2d2142" roughness={0.9} metalness={0.08} />
       </mesh>
+
+      {zones.map((zone) => {
+        const activeGame = miniGameByZone.get(zone.id);
+        if (zone.type === "rect") {
+          const bounds = zone.bounds || {};
+          const rectW = Math.max(0.1, (Number(bounds.xMax || world.w) - Number(bounds.xMin || 0)) * WORLD_SCALE);
+          const rectH = Math.max(0.1, (Number(bounds.yMax || world.h) - Number(bounds.yMin || 0)) * WORLD_SCALE);
+          const center = getZoneCenter(zone, world);
+          const scene = worldToScenePosition(world, center.x, center.y);
+          const zoneColor = ZONE_COLORS[zone.id] || ZONE_COLORS.default;
+          const active = Boolean(activeGame && activeGame.phase !== "cooldown");
+
+          return (
+            <group key={zone.id}>
+              <mesh rotation={[-Math.PI / 2, 0, 0]} position={[scene.x, 0.018, scene.z]} receiveShadow>
+                <planeGeometry args={[rectW, rectH]} />
+                <meshStandardMaterial
+                  color={zoneColor}
+                  roughness={0.88}
+                  metalness={0.08}
+                  emissive={zoneColor}
+                  emissiveIntensity={active ? 0.24 : 0.12}
+                />
+              </mesh>
+              <mesh rotation={[-Math.PI / 2, 0, 0]} position={[scene.x, 0.019, scene.z]}>
+                <ringGeometry args={[Math.min(rectW, rectH) * 0.38, Math.min(rectW, rectH) * 0.41, 28]} />
+                <meshBasicMaterial color="#f8d0a7" transparent opacity={active ? 0.32 : 0.14} />
+              </mesh>
+              <ZonePulseMarker world={world} zone={zone} active={active} color={zoneColor} />
+            </group>
+          );
+        }
+
+        return <ZonePulseMarker key={zone.id} world={world} zone={zone} active={Boolean(activeGame)} color="#7b67d8" />;
+      })}
 
       <mesh position={[0, 0.25, -height / 2 - 0.2]}>
         <boxGeometry args={[width + 1.6, 0.5, 0.4]} />
-        <meshStandardMaterial color="#45305c" roughness={0.85} />
+        <meshStandardMaterial color="#4a2f4f" roughness={0.84} />
       </mesh>
 
       <mesh position={[0, 0.25, height / 2 + 0.2]}>
         <boxGeometry args={[width + 1.6, 0.5, 0.4]} />
-        <meshStandardMaterial color="#45305c" roughness={0.85} />
+        <meshStandardMaterial color="#4a2f4f" roughness={0.84} />
       </mesh>
 
       <mesh position={[-width / 2 - 0.2, 0.25, 0]}>
         <boxGeometry args={[0.4, 0.5, height + 1.6]} />
-        <meshStandardMaterial color="#45305c" roughness={0.85} />
+        <meshStandardMaterial color="#4a2f4f" roughness={0.84} />
       </mesh>
 
       <mesh position={[width / 2 + 0.2, 0.25, 0]}>
         <boxGeometry args={[0.4, 0.5, height + 1.6]} />
-        <meshStandardMaterial color="#45305c" roughness={0.85} />
+        <meshStandardMaterial color="#4a2f4f" roughness={0.84} />
       </mesh>
+
+      <group>
+        {[{ x: 560, y: 620 }, { x: 720, y: 620 }, { x: 870, y: 620 }].map((point, index) => {
+          const scene = worldToScenePosition(world, point.x, point.y);
+          return (
+            <mesh key={`bench-${index}`} position={[scene.x, 0.13, scene.z]} castShadow receiveShadow>
+              <boxGeometry args={[0.34, 0.12, 0.12]} />
+              <meshStandardMaterial color="#704f39" roughness={0.74} />
+            </mesh>
+          );
+        })}
+      </group>
+
+      {showExtraProps ? (
+        <group>
+          {[{ x: 2040, y: 240 }, { x: 2260, y: 240 }, { x: 2480, y: 240 }].map((point, index) => {
+            const scene = worldToScenePosition(world, point.x, point.y);
+            return (
+              <mesh key={`stage-post-${index}`} position={[scene.x, 0.42, scene.z]} castShadow>
+                <cylinderGeometry args={[0.03, 0.03, 0.82, 10]} />
+                <meshStandardMaterial color="#c7a67f" emissive="#623228" emissiveIntensity={0.2} />
+              </mesh>
+            );
+          })}
+          {[{ x: 1960, y: 1060 }, { x: 2210, y: 1200 }, { x: 2470, y: 1380 }].map((point, index) => {
+            const scene = worldToScenePosition(world, point.x, point.y);
+            return (
+              <mesh key={`gallery-crate-${index}`} position={[scene.x, 0.12, scene.z]} castShadow receiveShadow>
+                <boxGeometry args={[0.2, 0.2, 0.2]} />
+                <meshStandardMaterial color="#6a4e35" roughness={0.7} />
+              </mesh>
+            );
+          })}
+        </group>
+      ) : null}
     </>
   );
 }
 
-function EnvironmentalLighting({ world }) {
+function EnvironmentalLighting({ world, miniGames, zones, lightingPreset }) {
   const width = world.w * WORLD_SCALE;
   const height = world.h * WORLD_SCALE;
   const cornerX = width * 0.42;
   const cornerZ = height * 0.42;
+  const isLow = lightingPreset === "low";
+  const isHigh = lightingPreset === "high";
+  const maxZoneAccentLights = isLow ? 1 : isHigh ? 3 : 2;
+  const activeMiniGames = (miniGames || []).filter((entry) => entry.phase !== "cooldown").slice(0, maxZoneAccentLights);
 
   return (
     <>
-      <fog attach="fog" args={["#161122", 10, 46]} />
+      <fog attach="fog" args={["#1c1430", isLow ? 12 : 10, isHigh ? 56 : 46]} />
 
-      <hemisphereLight intensity={0.58} color="#6f81dd" groundColor="#2c1224" />
-      <ambientLight intensity={0.24} color="#ffe6ca" />
+      <hemisphereLight intensity={isLow ? 0.52 : 0.62} color="#7a8fe0" groundColor="#31162c" />
+      <ambientLight intensity={isLow ? 0.24 : 0.3} color="#ffe5c9" />
 
       <directionalLight
-        position={[4.4, 9.8, 3.2]}
-        intensity={1.08}
-        castShadow
-        color="#ffd9b3"
-        shadow-mapSize-width={1024}
-        shadow-mapSize-height={1024}
+        position={[4.8, 10.5, 3.6]}
+        intensity={isHigh ? 1.2 : 1.05}
+        castShadow={!isLow}
+        color="#ffd3a9"
+        shadow-mapSize-width={isHigh ? 1536 : 1024}
+        shadow-mapSize-height={isHigh ? 1536 : 1024}
       />
 
-      <directionalLight position={[-6.2, 5.4, -4.8]} intensity={0.46} color="#8ea2ff" />
+      <directionalLight position={[-6.8, 5.8, -5.2]} intensity={isLow ? 0.32 : 0.46} color="#91a5ff" />
+      <directionalLight position={[0.6, 2.2, 8.6]} intensity={0.2} color="#91a9ff" />
 
-      <pointLight position={[-cornerX, 2.8, -cornerZ]} intensity={0.78} color="#8a96ff" distance={34} decay={2} />
-      <pointLight position={[cornerX, 2.3, cornerZ]} intensity={0.92} color="#ffaf77" distance={30} decay={2} />
+      <pointLight position={[-cornerX, 2.8, -cornerZ]} intensity={0.68} color="#90a0ff" distance={34} decay={2} />
+      <pointLight position={[cornerX, 2.3, cornerZ]} intensity={0.9} color="#ffaf77" distance={30} decay={2} />
+
+      {activeMiniGames.map((gameState) => {
+        const zone = zones.find((entry) => entry.id === gameState.zoneId);
+        if (!zone) {
+          return null;
+        }
+        const center = getZoneCenter(zone, world);
+        const scene = worldToScenePosition(world, center.x, center.y);
+        const accentColor = ZONE_COLORS[zone.id] || "#8f78d4";
+        return (
+          <ZoneAccentLight
+            key={`accent-${gameState.id}`}
+            position={[scene.x, 2.2, scene.z]}
+            color={accentColor}
+            baseIntensity={isLow ? 0.4 : 0.68}
+            distance={isHigh ? 24 : 18}
+          />
+        );
+      })}
     </>
   );
 }
@@ -640,7 +852,7 @@ function lerpAngle(current, target, alpha) {
   return current + delta * alpha;
 }
 
-function AvatarEntity({ id, isLocal, avatarUrl, playersRef, worldRef }) {
+function AvatarEntity({ id, isLocal, avatarId, avatarUrl, playersRef, worldRef }) {
   const groupRef = useRef(null);
   const modelRootRef = useRef(null);
   const mixerRef = useRef(null);
@@ -727,8 +939,10 @@ function AvatarEntity({ id, isLocal, avatarUrl, playersRef, worldRef }) {
     const mixer = new THREE.AnimationMixer(clonedModel);
     const nextActions = createEmptyActionsMap();
 
+    const compatibleClipKeys = resolveCompatibleClipKeysForAvatar(avatarId);
+
     for (const [key, clip] of Object.entries(clips)) {
-      if (!SAFE_FBX_CLIP_KEYS.has(key)) {
+      if (!compatibleClipKeys.has(key)) {
         continue;
       }
 
@@ -775,7 +989,7 @@ function AvatarEntity({ id, isLocal, avatarUrl, playersRef, worldRef }) {
         modelRootRef.current.remove(clonedModel);
       }
     };
-  }, [assetStatus, isLocal, avatarUrl]);
+  }, [assetStatus, avatarId, isLocal, avatarUrl]);
 
   useFrame((_, delta) => {
     const player = playersRef.current.get(id);
@@ -1138,6 +1352,81 @@ function normalizeQuestList(value) {
   }));
 }
 
+function normalizeZoneList(value) {
+  if (!Array.isArray(value) || !value.length) {
+    return DEFAULT_ZONE_DEFS;
+  }
+
+  return value
+    .map((zone) => ({
+      id: typeof zone?.id === "string" ? zone.id : "",
+      name: typeof zone?.name === "string" ? zone.name : "Zone",
+      type: typeof zone?.type === "string" ? zone.type : "rect",
+      miniGameId: typeof zone?.miniGameId === "string" ? zone.miniGameId : null,
+      bounds: zone?.bounds && typeof zone.bounds === "object" ? zone.bounds : {}
+    }))
+    .filter((zone) => zone.id);
+}
+
+function createEmptyZonePresence(zones) {
+  const next = {};
+  for (const zone of zones) {
+    next[zone.id] = [];
+  }
+  return next;
+}
+
+function normalizeMiniGameState(input) {
+  return {
+    id: typeof input?.id === "string" ? input.id : "",
+    zoneId: typeof input?.zoneId === "string" ? input.zoneId : "",
+    phase: typeof input?.phase === "string" ? input.phase : "active",
+    prompt: typeof input?.prompt === "string" ? input.prompt : null,
+    combo: Number.isFinite(input?.combo) ? input.combo : 0,
+    progress: Number.isFinite(input?.progress) ? input.progress : 0,
+    participants: Array.isArray(input?.participants) ? input.participants : [],
+    cycle: Number.isFinite(input?.cycle) ? input.cycle : 1,
+    waypointIndex: Number.isFinite(input?.waypointIndex) ? input.waypointIndex : 0,
+    requiresHappywalk: Boolean(input?.requiresHappywalk),
+    joined: false,
+    lastResult: null
+  };
+}
+
+function upsertMiniGameStates(previous, nextState) {
+  const normalized = normalizeMiniGameState(nextState);
+  const index = previous.findIndex((entry) => entry.id === normalized.id);
+  if (index === -1) {
+    return [...previous, normalized];
+  }
+
+  const next = [...previous];
+  next[index] = {
+    ...next[index],
+    ...normalized
+  };
+  return next;
+}
+
+function getZoneLabel(zones, zoneId) {
+  if (!zoneId) {
+    return "None";
+  }
+  const found = zones.find((zone) => zone.id === zoneId);
+  return found?.name || zoneId;
+}
+
+function downgradeLightingPreset(value) {
+  const normalized = normalizeLightingPreset(value);
+  if (normalized === "high") {
+    return "medium";
+  }
+  if (normalized === "medium") {
+    return "low";
+  }
+  return "low";
+}
+
 export default function App() {
   const [started, setStarted] = useState(() => {
     const params = new URLSearchParams(window.location.search);
@@ -1187,6 +1476,12 @@ export default function App() {
   });
   const [voiceHint, setVoiceHint] = useState("");
   const [blockedPlayerIds, setBlockedPlayerIds] = useState([]);
+  const [zones, setZones] = useState(DEFAULT_ZONE_DEFS);
+  const [zonePresence, setZonePresence] = useState(() => createEmptyZonePresence(DEFAULT_ZONE_DEFS));
+  const [miniGameStates, setMiniGameStates] = useState([]);
+  const [lightingPreset, setLightingPreset] = useState(() => selectInitialLightingPreset());
+  const [lightingAuto, setLightingAuto] = useState(true);
+  const [miniGameHint, setMiniGameHint] = useState("");
 
   const playersRef = useRef(new Map());
   const worldRef = useRef(WORLD_DEFAULT);
@@ -1212,9 +1507,31 @@ export default function App() {
   const questListRef = useRef(questList);
   const voiceRoomRef = useRef(null);
   const voiceTrackRef = useRef(null);
+  const zonesRef = useRef(zones);
+  const zonePresenceRef = useRef(zonePresence);
+  const miniGameStatesRef = useRef(miniGameStates);
+  const fpsSampleRef = useRef({ elapsed: 0, frames: 0, decided: false });
 
   const refreshPlayerIds = useCallback(() => {
     setPlayerIds(Array.from(playersRef.current.keys()));
+  }, []);
+
+  const refreshZonePresenceFromPlayers = useCallback(() => {
+    const next = createEmptyZonePresence(zonesRef.current);
+    for (const player of playersRef.current.values()) {
+      const zoneId =
+        player.zoneId || getZoneIdAtPosition(zonesRef.current, player.displayX || player.x, player.displayY || player.y, worldRef.current);
+      if (!zoneId || !next[zoneId]) {
+        continue;
+      }
+      next[zoneId] = [...next[zoneId], player.id];
+    }
+
+    for (const key of Object.keys(next)) {
+      next[key] = next[key].sort();
+    }
+
+    setZonePresence(next);
   }, []);
 
   const refreshRenderState = useCallback(() => {
@@ -1230,7 +1547,8 @@ export default function App() {
         y: Math.round(player.displayY),
         anim: resolveDesiredAnimation(player),
         emote: player.emote || null,
-        avatar: player.avatar || DEFAULT_CHARACTER_ID
+        avatar: player.avatar || DEFAULT_CHARACTER_ID,
+        zoneId: player.zoneId || getZoneIdAtPosition(zonesRef.current, player.displayX, player.displayY, worldRef.current)
       }));
 
     return {
@@ -1254,7 +1572,9 @@ export default function App() {
             vy: Math.round(selfPlayer.vy),
             anim: resolveDesiredAnimation(selfPlayer),
             emote: selfPlayer.emote || null,
-            avatar: selfPlayer.avatar || DEFAULT_CHARACTER_ID
+            avatar: selfPlayer.avatar || DEFAULT_CHARACTER_ID,
+            zoneId:
+              selfPlayer.zoneId || getZoneIdAtPosition(zonesRef.current, selfPlayer.displayX, selfPlayer.displayY, worldRef.current)
           }
         : null,
       others,
@@ -1290,11 +1610,27 @@ export default function App() {
         pushToTalk: voiceState.pushToTalk,
         nearbySpeakers: voiceState.nearbySpeakers
       },
+      miniGames: miniGameStatesRef.current.map((state) => ({
+        id: state.id,
+        zoneId: state.zoneId,
+        phase: state.phase,
+        prompt: state.prompt,
+        combo: state.combo,
+        progress: Number(state.progress.toFixed?.(3) || state.progress),
+        participants: state.participants
+      })),
+      zones: zonesRef.current.map((zone) => ({
+        id: zone.id,
+        name: zone.name,
+        miniGameId: zone.miniGameId || null,
+        players: zonePresenceRef.current[zone.id] || []
+      })),
+      lightingPreset,
       availableActions: contextActionsRef.current,
       selectedCharacter: selectedCharacterIdRef.current,
       pendingCharacter: pendingCharacterId
     };
-  }, [pendingCharacterId, progression, questList, voiceState]);
+  }, [lightingPreset, pendingCharacterId, progression, questList, voiceState]);
 
   const emitJoinRequest = useCallback(() => {
     const socket = socketRef.current;
@@ -1373,6 +1709,18 @@ export default function App() {
       const now = simulationTimeRef.current;
       const input = readInputState();
 
+      if (lightingAuto && !fpsSampleRef.current.decided) {
+        fpsSampleRef.current.frames += 1;
+        fpsSampleRef.current.elapsed += dt;
+        if (fpsSampleRef.current.elapsed >= 2.4) {
+          const fps = fpsSampleRef.current.frames / fpsSampleRef.current.elapsed;
+          if (fps < 42) {
+            setLightingPreset((previous) => downgradeLightingPreset(previous));
+          }
+          fpsSampleRef.current.decided = true;
+        }
+      }
+
       const self = playersRef.current.get(selfIdRef.current);
       let moveX = input.moveX;
       let moveY = input.moveY;
@@ -1412,6 +1760,9 @@ export default function App() {
         const correctingAlpha = Math.hypot(self.vx, self.vy) > 8 ? 0.02 : 0.15;
         self.x = lerp(self.x, self.serverX, correctingAlpha);
         self.y = lerp(self.y, self.serverY, correctingAlpha);
+        if (!self.zoneId) {
+          self.zoneId = getZoneIdAtPosition(zonesRef.current, self.x, self.y, worldRef.current);
+        }
 
         if (socketRef.current && now - lastIntentAtRef.current >= INTENT_SEND_INTERVAL_MS) {
           socketRef.current.emit("intent", {
@@ -1479,7 +1830,7 @@ export default function App() {
         refreshPlayerIds();
       }
     },
-    [readInputState, refreshPlayerIds]
+    [lightingAuto, readInputState, refreshPlayerIds]
   );
 
   useEffect(() => {
@@ -1611,6 +1962,44 @@ export default function App() {
   useEffect(() => {
     questListRef.current = questList;
   }, [questList]);
+
+  useEffect(() => {
+    zonesRef.current = zones;
+  }, [zones]);
+
+  useEffect(() => {
+    zonePresenceRef.current = zonePresence;
+  }, [zonePresence]);
+
+  useEffect(() => {
+    miniGameStatesRef.current = miniGameStates;
+  }, [miniGameStates]);
+
+  useEffect(() => {
+    setMiniGameStates((previous) =>
+      previous.map((entry) => ({
+        ...entry,
+        joined: Boolean((zonePresence[entry.zoneId] || []).includes(selfIdRef.current))
+      }))
+    );
+  }, [selfIdState, zonePresence]);
+
+  useEffect(() => {
+    if (lightingAuto) {
+      setLightingPreset(selectInitialLightingPreset());
+      fpsSampleRef.current = { elapsed: 0, frames: 0, decided: false };
+    } else {
+      fpsSampleRef.current = { elapsed: 0, frames: 0, decided: true };
+    }
+  }, [lightingAuto]);
+
+  useEffect(() => {
+    if (!miniGameHint) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setMiniGameHint(""), 1800);
+    return () => window.clearTimeout(timer);
+  }, [miniGameHint]);
 
   useEffect(() => {
     selectedCharacterIdRef.current = normalizeCharacterId(selectedCharacterId);
@@ -1776,6 +2165,25 @@ export default function App() {
       setSelfIdState(selfIdRef.current);
       setRoomVoiceEnabled(Boolean(msg?.roomVoiceEnabled));
 
+      const nextZones = normalizeZoneList(msg?.zones);
+      setZones(nextZones);
+
+      const nextPresence = createEmptyZonePresence(nextZones);
+      for (const player of nextPlayers.values()) {
+        if (!player.zoneId) {
+          player.zoneId = getZoneIdAtPosition(nextZones, player.x, player.y, incomingWorld);
+        }
+        if (player.zoneId && nextPresence[player.zoneId]) {
+          nextPresence[player.zoneId] = [...nextPresence[player.zoneId], player.id];
+        }
+      }
+      for (const key of Object.keys(nextPresence)) {
+        nextPresence[key] = nextPresence[key].sort();
+      }
+      setZonePresence(nextPresence);
+
+      setMiniGameStates(Array.isArray(msg?.miniGames) ? msg.miniGames.map(normalizeMiniGameState) : []);
+
       if (msg?.profile || msg?.progression || msg?.quests) {
         const currentAuth = authRef.current;
         applyAuthPayload(
@@ -1810,6 +2218,7 @@ export default function App() {
 
       playersRef.current.set(player.id, createPlayerState(player, worldRef.current));
       refreshPlayerIds();
+      refreshZonePresenceFromPlayers();
     });
 
     socket.on("player_left", ({ id }) => {
@@ -1825,6 +2234,7 @@ export default function App() {
       }
 
       refreshPlayerIds();
+      refreshZonePresenceFromPlayers();
     });
 
     socket.on("state", (msg) => {
@@ -1848,11 +2258,17 @@ export default function App() {
         if (incoming.avatar) {
           player.avatar = normalizeCharacterId(incoming.avatar);
         }
+        if (typeof incoming.zoneId === "string" || incoming.zoneId === null) {
+          player.zoneId = incoming.zoneId || null;
+        }
 
         player.serverX = Number.isFinite(incoming.x) ? incoming.x : player.serverX;
         player.serverY = Number.isFinite(incoming.y) ? incoming.y : player.serverY;
         player.vx = Number.isFinite(incoming.vx) ? incoming.vx : player.vx;
         player.vy = Number.isFinite(incoming.vy) ? incoming.vy : player.vy;
+        if (!player.zoneId && Number.isFinite(player.serverX) && Number.isFinite(player.serverY)) {
+          player.zoneId = getZoneIdAtPosition(zonesRef.current, player.serverX, player.serverY, worldRef.current);
+        }
         const inferredSpeed = Math.hypot(player.vx, player.vy);
         player.anim =
           incoming.anim || (inferredSpeed > PLAYER_SPEED * 0.72 ? "run" : inferredSpeed > 8 ? "walk" : "idle");
@@ -1867,6 +2283,7 @@ export default function App() {
       if (changed) {
         refreshPlayerIds();
       }
+      refreshZonePresenceFromPlayers();
     });
 
     socket.on("emote", ({ id, type }) => {
@@ -1947,6 +2364,68 @@ export default function App() {
       });
     });
 
+    socket.on("zone_presence", ({ zoneId, players }) => {
+      if (!zoneId) {
+        return;
+      }
+      const nextPlayers = Array.isArray(players) ? players : [];
+      setZonePresence((previous) => ({
+        ...previous,
+        [zoneId]: nextPlayers
+      }));
+    });
+
+    socket.on("minigame_state", (payload) => {
+      if (!payload?.id) {
+        return;
+      }
+      setMiniGameStates((previous) =>
+        upsertMiniGameStates(previous, {
+          ...payload,
+          joined: Boolean((zonePresenceRef.current[payload.zoneId] || []).includes(selfIdRef.current))
+        })
+      );
+    });
+
+    socket.on("minigame_action_result", (payload) => {
+      if (!payload?.id) {
+        return;
+      }
+
+      setMiniGameStates((previous) =>
+        previous.map((entry) =>
+          entry.id === payload.id
+            ? {
+                ...entry,
+                combo: Number.isFinite(payload.combo) ? payload.combo : entry.combo,
+                lastResult: {
+                  playerId: payload.playerId || null,
+                  action: payload.action || null,
+                  success: Boolean(payload.success),
+                  scoreDelta: Number.isFinite(payload.scoreDelta) ? payload.scoreDelta : 0,
+                  at: Date.now()
+                }
+              }
+            : entry
+        )
+      );
+    });
+
+    socket.on("minigame_reward", ({ id, stars, xp, level, totalXp, balance }) => {
+      setProgression((previous) => ({
+        ...previous,
+        stars: Number.isFinite(balance) ? balance : previous.stars + (Number.isFinite(stars) ? stars : 0),
+        xp: Number.isFinite(totalXp) ? totalXp : previous.xp + (Number.isFinite(xp) ? xp : 0),
+        level: Number.isFinite(level) ? level : previous.level
+      }));
+
+      if (id) {
+        const amount = Number.isFinite(stars) ? stars : 0;
+        const gainedXp = Number.isFinite(xp) ? xp : 0;
+        setMiniGameHint(`${MINI_GAME_LABELS[id] || "Mini-game"} reward +${amount} stars, +${gainedXp} XP`);
+      }
+    });
+
     return () => {
       socket.removeAllListeners();
       socket.disconnect();
@@ -1970,8 +2449,10 @@ export default function App() {
       setPlayerIds([]);
       contextActionsRef.current = [];
       setContextActions([]);
+      setZonePresence(createEmptyZonePresence(zonesRef.current));
+      setMiniGameStates([]);
     };
-  }, [applyAuthPayload, emitJoinRequest, refreshPlayerIds, selectedCharacterId, started]);
+  }, [applyAuthPayload, emitJoinRequest, refreshPlayerIds, refreshZonePresenceFromPlayers, selectedCharacterId, started]);
 
   const confirmCharacterSelection = useCallback((characterId) => {
     const normalized = normalizeCharacterId(characterId);
@@ -2350,6 +2831,13 @@ export default function App() {
 
   const pendingCharacter = pendingCharacterId ? getCharacterById(pendingCharacterId) : null;
   const selectedCharacter = getCharacterById(selectedCharacterId);
+  const selfPlayer = selfIdState ? playersRef.current.get(selfIdState) : null;
+  const currentZoneId = selfPlayer
+    ? selfPlayer.zoneId || getZoneIdAtPosition(zones, selfPlayer.x, selfPlayer.y, worldRef.current)
+    : null;
+  const currentZoneLabel = getZoneLabel(zones, currentZoneId);
+  const activeMiniGames = miniGameStates.filter((state) => state.phase !== "cooldown");
+  const currentZoneMiniGame = activeMiniGames.find((state) => state.zoneId === currentZoneId) || null;
 
   const handleMoveCommand = useCallback((nextX, nextY) => {
     if (!startedRef.current) {
@@ -2365,33 +2853,42 @@ export default function App() {
     setMoveTarget(boundedTarget);
   }, []);
 
+  const handleLightingPresetSelect = useCallback((event) => {
+    setLightingAuto(false);
+    setLightingPreset(normalizeLightingPreset(event.target.value));
+  }, []);
+
+  const handleLightingAutoToggle = useCallback(() => {
+    setLightingAuto((previous) => !previous);
+  }, []);
+
   return (
     <div style={{ width: "100vw", height: "100vh", position: "relative", background: "#100d17" }}>
-      <Canvas shadows camera={{ position: [8.5, 10.8, 14.2], fov: 46 }}>
+      <Canvas shadows={lightingPreset !== "low"} camera={{ position: [8.5, 10.8, 14.2], fov: 46 }}>
         <color attach="background" args={["#140f1d"]} />
 
-        <EnvironmentalLighting world={worldView} />
+        <EnvironmentalLighting world={worldView} miniGames={miniGameStates} zones={zones} lightingPreset={lightingPreset} />
 
-        <StudioEnvironment world={worldView} />
+        <StudioEnvironment world={worldView} zones={zones} miniGames={miniGameStates} lightingPreset={lightingPreset} />
         <ClickMoveSurface world={worldView} enabled={started} moveTarget={moveTarget} onMoveCommand={handleMoveCommand} />
 
         <SimulationDriver stepRef={stepRef} />
         <FollowCamera playersRef={playersRef} selfIdRef={selfIdRef} worldRef={worldRef} />
 
-        {playerIds.map((id) => (
-          <AvatarEntity
-            key={id}
-            id={id}
-            isLocal={id === selfIdState}
-            avatarUrl={
-              getCharacterById(
-                playersRef.current.get(id)?.avatar || (id === selfIdState ? selectedCharacter.id : DEFAULT_CHARACTER_ID)
-              ).avatarUrl
-            }
-            playersRef={playersRef}
-            worldRef={worldRef}
-          />
-        ))}
+        {playerIds.map((id) => {
+          const avatarId = playersRef.current.get(id)?.avatar || (id === selfIdState ? selectedCharacter.id : DEFAULT_CHARACTER_ID);
+          return (
+            <AvatarEntity
+              key={id}
+              id={id}
+              isLocal={id === selfIdState}
+              avatarId={avatarId}
+              avatarUrl={getCharacterById(avatarId).avatarUrl}
+              playersRef={playersRef}
+              worldRef={worldRef}
+            />
+          );
+        })}
 
       </Canvas>
 
@@ -2772,6 +3269,14 @@ export default function App() {
             <div>
               Progress: Lv {progression.level} | XP {progression.xp} | Stars {progression.stars}
             </div>
+            <div>Zone: {currentZoneLabel}</div>
+            <div>
+              Mini-game: {currentZoneMiniGame ? MINI_GAME_LABELS[currentZoneMiniGame.id] || currentZoneMiniGame.id : "None"}
+            </div>
+            <div>
+              Lighting: {lightingPreset}
+              {lightingAuto ? " (Auto)" : ""}
+            </div>
             <div style={{ marginTop: 4, fontSize: "0.78rem", opacity: 0.85 }}>
               Nearby: {contextActions.length ? contextActions.map((key) => EMOTE_LABELS[key]).join(", ") : "None"}
             </div>
@@ -2810,6 +3315,75 @@ export default function App() {
             ) : (
               <div style={{ opacity: 0.82 }}>Login to track quest progression.</div>
             )}
+          </div>
+
+          <div
+            style={{
+              position: "absolute",
+              top: isCoarsePointer ? 338 : 414,
+              left: 14,
+              width: isCoarsePointer ? 220 : 300,
+              padding: "10px 12px",
+              borderRadius: 12,
+              background: "rgba(20, 14, 31, 0.78)",
+              color: "#f8efdf",
+              fontSize: "0.8rem",
+              border: "1px solid rgba(255, 255, 255, 0.12)",
+              lineHeight: 1.35
+            }}
+          >
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>Mini-Games</div>
+            {activeMiniGames.length ? (
+              activeMiniGames.map((game) => (
+                <div key={game.id} style={{ marginBottom: 6, opacity: 0.92 }}>
+                  <div style={{ color: "#ffe8c4", fontWeight: 600 }}>
+                    {MINI_GAME_LABELS[game.id] || game.id} {game.joined ? "(In Zone)" : ""}
+                  </div>
+                  <div>
+                    Prompt: {game.prompt || "none"} | Combo: {game.combo} | Progress:{" "}
+                    {Math.round((Number(game.progress) || 0) * 100)}%
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div style={{ opacity: 0.78 }}>No active mini-games yet.</div>
+            )}
+            <div style={{ marginTop: 8, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+              <button
+                type="button"
+                onClick={handleLightingAutoToggle}
+                style={{
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  borderRadius: 8,
+                  padding: "6px 8px",
+                  color: "#fff8ec",
+                  background: lightingAuto ? "rgba(61,39,92,0.88)" : "rgba(35,24,52,0.8)",
+                  cursor: "pointer"
+                }}
+              >
+                {lightingAuto ? "Auto Light On" : "Auto Light Off"}
+              </button>
+              <select
+                value={lightingPreset}
+                onChange={handleLightingPresetSelect}
+                style={{
+                  borderRadius: 8,
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  background: "rgba(17,12,27,0.88)",
+                  color: "#fff6e8",
+                  padding: "6px 8px"
+                }}
+              >
+                {LIGHTING_PRESET_ORDER.map((preset) => (
+                  <option key={preset} value={preset}>
+                    {preset}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {miniGameHint ? (
+              <div style={{ marginTop: 8, color: "#ffd6a8", fontWeight: 600, fontSize: "0.76rem" }}>{miniGameHint}</div>
+            ) : null}
           </div>
 
           {contextActions.length ? (
