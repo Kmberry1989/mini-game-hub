@@ -380,3 +380,68 @@ Original prompt: Create a plan to... develop this game further
 ### Remaining TODOs / follow-up
 - Finish per-avatar clip compatibility matrix (instead of current conservative runtime blocklist).
 - Add deterministic smoke sequence that forces successful `emote_echo_circle`, `prop_relay_bench`, and `glow_trail_walk` reward grants in one scripted run.
+
+## 2026-02-28 - Mixer/procedural transform conflict fix
+- Confirmed `AvatarEntity` was still allowing mixer-driven action playback fallback (`desired -> idle`) while procedural poses were active.
+- Updated animation transition logic to avoid overlap:
+  - procedural-only desired states now call `mixer.stopAllAction()` during transition.
+  - mixer updates run only when the desired state has a rig clip.
+  - added `relaxProceduralPose(...)` to smoothly return modelRoot transforms to neutral when switching back to rig-driven clips.
+- This addresses root-level transform fighting during clip transitions (especially movement -> contextual/emote states).
+
+### Verification
+- Build passes: `npm run build:client`.
+- Live smoke run (isolated ports): `/tmp/mini-game-hub-mixer-fix-check`.
+- No `errors-*.json` emitted in the smoke run.
+
+## 2026-03-03 - Gallery golf mini-game integration
+- Implemented a new server-authoritative mini-game: `gallery_golf_putt`.
+  - Added to zone/content definitions and wired `gallery` to this mini-game.
+  - Added new action type `golfshot` to allowed emotes/action handling.
+  - Added runtime state fields (`ballProgress`, `shotCount`, `sinkCount`, `resetAt`) and public state serialization.
+  - Added shot resolution + sink/cooldown loop with rewards/milestones and quest delta hooks.
+- Implemented client golf UX + rendering in the hub.
+  - Added gallery golf action/labels (`golfshot`) to shared emote/action config.
+  - Added golf animation loading (`/assets/golf/animations/Golf Drive.fbx`) and animation mapping (`golfshot`).
+  - Added gallery golf scene dressing using new GLB assets from `client/public/assets/golf/models`.
+  - Added moving ball indicator tied to server `ballProgress` and hole/celebration markers.
+  - Added golf state fields to `render_game_to_text` payload for deterministic test validation.
+  - Added keyboard shortcuts for golf shot (`0`, `g`, and deterministic test key `b`).
+  - Updated mini-game HUD labels/stats to show golf sinks/shots and prompt naming.
+
+### Validation artifacts
+- Client build pass: `npm run build:client` (latest: success).
+- Server syntax check pass: `node --check server/src/index.js`.
+- Playwright skill loop (with screenshot + text-state checks):
+  - `/tmp/mini-game-hub-golf6` confirmed golf shot trigger (`shotCount: 1`, `ballProgress: 0.358`).
+  - `/tmp/mini-game-hub-golf7` confirmed repeated shots (`shotCount: 5`, `ballProgress: 0.928`) and ball indicator progression.
+  - `/tmp/mini-game-hub-golf8` confirmed sink/cooldown transition (`phase: cooldown`, `sinkCount: 1`, `shotCount: 6`, `ballProgress: 1`).
+  - No `errors-*.json` generated in the latest runs above.
+
+### Notes / TODO
+- Current golf props are intentionally stylized and lightweight; if stricter realism is desired, tune GLB placement/scale and course layout positions.
+- Mini-game left panel currently hides cooldown-phase games (legacy behavior). If preferred, include cooldown entries so golf remains visible during celebration windows.
+
+## 2026-03-03 - Solo full-course mode (local play)
+- Added a dedicated solo mode entry flow from the character screen (`Play Solo Course`) and URL support (`?solo=1` / `?mode=solo-golf`).
+- Added new client module `client/src/SoloGolfCourse.jsx` implementing a local single-player course loop:
+  - 9-hole course data with par, tee/cup, fairway routing, bunkers, water, and wall obstacles.
+  - Ball physics (friction, bounce, wall collisions), water penalties, lie resets, cup detection, and score progression.
+  - Hole completion flow (`next hole`), full-course completion, restart, and exit-to-hub actions.
+  - Deterministic test hooks: `window.render_game_to_text` and `window.advanceTime(ms)` for automated control.
+  - Keyboard controls: drag-to-shoot, `B` auto-shot, `R` reset lie (+1), `N` next hole, `K` concede hole, `F` fullscreen.
+- Updated `client/src/App.jsx` to hand off control/hotkeys/render-test hooks to solo mode without multiplayer-hub conflicts.
+
+### Validation artifacts (solo mode)
+- Build: `npm run build:client` passed after solo-course integration.
+- Playwright skill runs (URL `http://localhost:5173/?solo=1`):
+  - `/tmp/mini-game-hub-solo2` confirmed repeated shot simulation with moving ball physics and scoring updates.
+  - `/tmp/mini-game-hub-solo4` confirmed hole progression behavior (concede + next flow) and advancing to later holes:
+    - state-0: hole 2
+    - state-1: hole 3
+    - state-2: hole 4
+  - No `errors-*.json` emitted in the latest runs.
+
+### Notes / TODO
+- Solo mode currently uses stylized 2D course rendering to prioritize playability and deterministic testing speed.
+- Multiplayer golf remains deferred; solo mode is fully local and intentionally server-independent for now.

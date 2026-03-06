@@ -591,6 +591,25 @@ function createMiniGameRuntime(gameDef, now) {
     };
   }
 
+  if (gameDef.id === "gallery_golf_putt") {
+    return {
+      id: gameDef.id,
+      zoneId: gameDef.zoneId,
+      phase: "active",
+      prompt: gameDef.shotAction || "golfshot",
+      combo: 0,
+      progress: 0,
+      participants: new Set(),
+      cycle: 1,
+      sinkCount: 0,
+      shotCount: 0,
+      ballProgress: 0,
+      resetAt: 0,
+      lastActionAt: now,
+      awardedMilestones: new Set()
+    };
+  }
+
   return {
     id: gameDef.id,
     zoneId: gameDef.zoneId,
@@ -635,7 +654,10 @@ function toPublicMiniGameState(gameState) {
     participants: participantIds,
     cycle: Number(gameState.cycle || 1),
     waypointIndex: Number(gameState.waypointIndex || 0),
-    requiresHappywalk: Boolean(gameState.requiresHappywalk)
+    requiresHappywalk: Boolean(gameState.requiresHappywalk),
+    sinkCount: Number(gameState.sinkCount || 0),
+    shotCount: Number(gameState.shotCount || 0),
+    ballProgress: Number(gameState.ballProgress || 0)
   };
 }
 
@@ -890,6 +912,103 @@ function handleGlowTrailAction(roomId, gameDef, gameState, player, action) {
   return true;
 }
 
+function handleGolfPuttAction(roomId, gameDef, gameState, player, action, now) {
+  if (player.zoneId !== gameDef.zoneId) {
+    return false;
+  }
+
+  const shotAction = gameDef.shotAction || "golfshot";
+  if (action !== shotAction) {
+    return false;
+  }
+
+  const teePoint = gameDef.teePoint || { x: player.x, y: player.y };
+  const teeRadius = Math.max(90, Number(gameDef.teeRadius || 180));
+  const distanceToTee = Math.hypot(player.x - Number(teePoint.x || player.x), player.y - Number(teePoint.y || player.y));
+  const moveSpeed = Math.hypot(player.vx || 0, player.vy || 0);
+  const movingTooFast = moveSpeed > PLAYER_SPEED * 0.82;
+  gameState.lastActionAt = now;
+  gameState.participants.add(player.id);
+
+  const teeAlignment = clamp(1 - distanceToTee / teeRadius, 0, 1);
+  const stability = clamp(1 - moveSpeed / (PLAYER_SPEED * 0.82), 0, 1);
+  const shotPenalty = distanceToTee > teeRadius || movingTooFast ? 0.38 : 1;
+  const randomness = Math.random() * 0.26;
+  const shotQuality = clamp((0.3 + teeAlignment * 0.36 + stability * 0.34 + randomness) * shotPenalty, 0.05, 1.12);
+  const existingProgress = clamp(Number(gameState.ballProgress || 0), 0, 1);
+  const remaining = 1 - existingProgress;
+  const progressGain = clamp(0.14 + shotQuality * 0.6 + Math.random() * 0.16, 0.1, 1);
+
+  gameState.ballProgress = clamp(existingProgress + remaining * progressGain, 0, 1);
+  gameState.shotCount = Number(gameState.shotCount || 0) + 1;
+  gameState.progress = gameState.ballProgress;
+  gameState.prompt = shotAction;
+
+  const sinkThreshold = clamp(Number(gameDef.successThreshold || 0.96), 0.72, 0.999);
+  const sunkPutt = gameState.ballProgress >= sinkThreshold;
+  let scoreDelta = Math.max(1, Math.round(progressGain * 2));
+
+  if (sunkPutt) {
+    gameState.phase = "cooldown";
+    gameState.ballProgress = 1;
+    gameState.progress = 1;
+    gameState.prompt = "celebrate";
+    gameState.combo += 1;
+    gameState.sinkCount = Number(gameState.sinkCount || 0) + 1;
+    gameState.resetAt = now + Number(gameDef.resetDelayMs || 1600);
+    scoreDelta = 3;
+
+    applyQuestDelta(player.userId, "minigame_completion", 1, { gameId: gameDef.id });
+    applyQuestDelta(player.userId, "minigame_combo", 1, { gameId: gameDef.id, combo: gameState.combo });
+
+    const baseStars = Number(gameDef.rewardPerSink?.stars || 0);
+    const baseXp = Number(gameDef.rewardPerSink?.xp || 0);
+    const zonePlayers = listPlayersByRoom(roomId).filter((entry) => entry.zoneId === gameDef.zoneId);
+    const teamBonusStars = zonePlayers.length > 1 ? 4 : 0;
+    const teamBonusXp = zonePlayers.length > 1 ? 6 : 0;
+
+    awardMiniGameReward(
+      player,
+      gameDef.id,
+      `cycle:${gameState.cycle}:sink:${gameState.sinkCount}:player:${player.id}`,
+      baseStars + teamBonusStars,
+      baseXp + teamBonusXp
+    );
+
+    for (const milestone of gameDef.rewardMilestones || []) {
+      const marker = Number(milestone.sinks || 0);
+      if (!marker || gameState.sinkCount < marker || gameState.awardedMilestones.has(marker)) {
+        continue;
+      }
+
+      gameState.awardedMilestones.add(marker);
+      for (const rewardPlayer of zonePlayers) {
+        awardMiniGameReward(
+          rewardPlayer,
+          gameDef.id,
+          `cycle:${gameState.cycle}:milestone:${marker}:player:${rewardPlayer.id}`,
+          milestone.stars,
+          milestone.xp
+        );
+      }
+    }
+  } else {
+    gameState.phase = "active";
+  }
+
+  io.to(roomId).emit("minigame_action_result", {
+    id: gameDef.id,
+    playerId: player.id,
+    action,
+    success: sunkPutt || progressGain >= 0.3,
+    scoreDelta,
+    combo: gameState.combo
+  });
+
+  applyQuestDelta(player.userId, "minigame_participation", 1, { gameId: gameDef.id });
+  return true;
+}
+
 function handleMiniGameAction(player, action, now) {
   const roomState = ensureRoomMiniGameState(player.roomId, now);
 
@@ -908,6 +1027,10 @@ function handleMiniGameAction(player, action, now) {
     }
 
     if (gameDef.id === "glow_trail_walk" && handleGlowTrailAction(player.roomId, gameDef, gameState, player, action)) {
+      return;
+    }
+
+    if (gameDef.id === "gallery_golf_putt" && handleGolfPuttAction(player.roomId, gameDef, gameState, player, action, now)) {
       return;
     }
   }
@@ -1029,6 +1152,28 @@ function stepMiniGamesForRoom(roomId, roomPlayers, now) {
 
       gameState.progress = waypoints.length ? gameState.waypointIndex / waypoints.length : 0;
       gameState.prompt = gameState.requiresHappywalk ? "happywalk" : "reach_waypoint";
+    }
+
+    if (gameDef.id === "gallery_golf_putt") {
+      const shotAction = gameDef.shotAction || "golfshot";
+      if (gameState.phase === "cooldown" && now >= Number(gameState.resetAt || 0)) {
+        gameState.phase = "active";
+        gameState.prompt = shotAction;
+        gameState.ballProgress = 0;
+        gameState.progress = 0;
+        gameState.cycle += 1;
+      }
+
+      if (now - Number(gameState.lastActionAt || now) > 12000 && gameState.combo > 0) {
+        gameState.combo = Math.max(0, gameState.combo - 1);
+        gameState.lastActionAt = now;
+      }
+
+      if (gameState.phase !== "cooldown") {
+        gameState.prompt = shotAction;
+      }
+
+      gameState.progress = clamp(Number(gameState.ballProgress || 0), 0, 1);
     }
 
     io.to(roomId).emit("minigame_state", toPublicMiniGameState(gameState));

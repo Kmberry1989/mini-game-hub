@@ -35,6 +35,7 @@ import {
   signup,
   updateAvatar
 } from "./game/api";
+import SoloGolfCourse from "./SoloGolfCourse";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:3001";
 const DEFAULT_ROOM_ID = "studio-1";
@@ -47,6 +48,7 @@ const animationCache = {
 };
 
 const avatarSceneCache = new Map();
+const staticPropCache = new Map();
 
 const CHARACTER_OPTIONS = [
   { id: "kyle", label: "Kyle", avatarUrl: "/assets/avatars/kyle.glb", cardImageUrl: "/assets/char select/KYLE.png" },
@@ -82,6 +84,7 @@ const ANIMATION_URLS = {
   openlid: "/assets/animations/openlid.fbx",
   sittingvictory: "/assets/animations/sittingvictory.fbx",
   happywalk: "/assets/animations/happywalk.fbx",
+  golfshot: "/assets/golf/animations/Golf Drive.fbx",
   bored: "/assets/animations/bored.fbx",
   yawn: "/assets/animations/yawn.fbx"
 };
@@ -95,13 +98,15 @@ const EMOTE_TO_ANIMATION = {
   pickup: "pickup",
   openlid: "openlid",
   sittingvictory: "sittingvictory",
-  happywalk: "happywalk"
+  happywalk: "happywalk",
+  golfshot: "golfshot"
 };
 
 const CONTEXT_ACTION_RADII = {
   pickup: 96,
   openlid: 96,
-  sittingvictory: 108
+  sittingvictory: 108,
+  golfshot: 186
 };
 
 const ACTION_DURATION_MS = {
@@ -113,7 +118,8 @@ const ACTION_DURATION_MS = {
   pickup: 1300,
   openlid: 1500,
   sittingvictory: 1800,
-  happywalk: 1600
+  happywalk: 1600,
+  golfshot: 1700
 };
 
 const MODEL_YAW_OFFSET = 0;
@@ -128,6 +134,15 @@ const LOOPING_ANIMATION_KEYS = new Set(["idle", "walk", "run", "happywalk", "bor
 const ROOT_MOTION_BONE = "mixamorigHips";
 const CLICK_MOVE_STOP_RADIUS = 22;
 const MAX_ROOT_TILT_RADIANS = Math.PI * 0.36;
+const GOLF_MODEL_URLS = {
+  cart: "/assets/golf/models/golf%20cart.glb",
+  driver: "/assets/golf/models/golf%20driver.glb",
+  flag: "/assets/golf/models/golf%20hole%20flag.glb",
+  green: "/assets/golf/models/grass%20green.glb",
+  ball: "/assets/golf/models/golf%20ball.glb",
+  putter: "/assets/golf/models/golf%20putter.glb",
+  tee: "/assets/golf/models/golf%20tee.glb"
+};
 
 function resolveCompatibleClipKeysForAvatar(avatarId) {
   const normalized = normalizeCharacterId(avatarId);
@@ -165,6 +180,7 @@ function createEmptyActionsMap() {
     openlid: null,
     sittingvictory: null,
     happywalk: null,
+    golfshot: null,
     bored: null,
     yawn: null
   };
@@ -226,6 +242,7 @@ function loadAnimationClips() {
         openlid: loadedClips.openlid || loadedClips.wave || idle,
         sittingvictory: loadedClips.sittingvictory || loadedClips.bored || idle,
         happywalk: loadedClips.happywalk || loadedClips.walk || walk,
+        golfshot: loadedClips.golfshot || loadedClips.jump || walk,
         bored: loadedClips.bored || idle,
         yawn: loadedClips.yawn || loadedClips.bored || idle
       };
@@ -302,6 +319,101 @@ function loadAvatarBundleWithFallback(avatarUrl) {
   });
 }
 
+function loadStaticPropScene(url) {
+  if (!url) {
+    return Promise.resolve(null);
+  }
+
+  const cached = staticPropCache.get(url);
+  if (cached?.status === "loaded") {
+    return Promise.resolve(cached.scene);
+  }
+  if (cached?.status === "loading") {
+    return cached.promise;
+  }
+
+  const gltfLoader = new GLTFLoader();
+  const nextEntry = {
+    status: "loading",
+    promise: null,
+    scene: null,
+    error: null
+  };
+
+  nextEntry.promise = gltfLoader
+    .loadAsync(url)
+    .then((gltf) => {
+      nextEntry.status = "loaded";
+      nextEntry.scene = gltf?.scene || null;
+      return nextEntry.scene;
+    })
+    .catch((error) => {
+      console.warn(`Static model load failed for ${url}:`, error);
+      nextEntry.status = "error";
+      nextEntry.error = error;
+      return null;
+    });
+
+  staticPropCache.set(url, nextEntry);
+  return nextEntry.promise;
+}
+
+function StaticPropModel({
+  url,
+  position = [0, 0, 0],
+  rotation = [0, 0, 0],
+  scale = 1,
+  castShadow = true,
+  receiveShadow = true
+}) {
+  const [sourceScene, setSourceScene] = useState(null);
+  const resolvedScale = Array.isArray(scale) ? scale : [scale, scale, scale];
+
+  useEffect(() => {
+    let mounted = true;
+    setSourceScene(null);
+    loadStaticPropScene(url).then((scene) => {
+      if (!mounted) {
+        return;
+      }
+      setSourceScene(scene);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [url]);
+
+  const cloned = useMemo(() => {
+    if (!sourceScene) {
+      return null;
+    }
+    const clone = sourceScene.clone(true);
+    clone.traverse((node) => {
+      if (!node?.isMesh) {
+        return;
+      }
+
+      node.castShadow = castShadow;
+      node.receiveShadow = receiveShadow;
+
+      const materials = Array.isArray(node.material) ? node.material : [node.material];
+      for (const material of materials) {
+        if (!material) {
+          continue;
+        }
+        material.side = THREE.FrontSide;
+      }
+    });
+    return clone;
+  }, [castShadow, receiveShadow, sourceScene]);
+
+  if (!cloned) {
+    return null;
+  }
+
+  return <primitive object={cloned} position={position} rotation={rotation} scale={resolvedScale} />;
+}
+
 function worldToScenePosition(world, x, y) {
   return {
     x: (x - world.w / 2) * WORLD_SCALE,
@@ -371,6 +483,10 @@ function resolveContextActions(player, world, input) {
   if (isMoving) {
     available.push("jump");
     available.push("happywalk");
+  }
+
+  if (!isMoving && player.zoneId === "gallery") {
+    available.push("golfshot");
   }
 
   for (const action of ["pickup", "openlid", "sittingvictory"]) {
@@ -609,11 +725,25 @@ function applyProceduralPose(modelRoot, desiredAnimation, speed, timeSeconds, al
   modelRoot.scale.setScalar(THREE.MathUtils.lerp(modelRoot.scale.x, scale, alpha));
 }
 
+function relaxProceduralPose(modelRoot, alpha = 0.16) {
+  if (!modelRoot) {
+    return;
+  }
+
+  modelRoot.position.x = THREE.MathUtils.lerp(modelRoot.position.x, 0, alpha);
+  modelRoot.position.y = THREE.MathUtils.lerp(modelRoot.position.y, 0, alpha);
+  modelRoot.position.z = THREE.MathUtils.lerp(modelRoot.position.z, 0, alpha);
+  modelRoot.rotation.x = THREE.MathUtils.lerp(modelRoot.rotation.x, 0, alpha);
+  modelRoot.rotation.y = THREE.MathUtils.lerp(modelRoot.rotation.y, 0, alpha);
+  modelRoot.rotation.z = THREE.MathUtils.lerp(modelRoot.rotation.z, 0, alpha);
+  modelRoot.scale.setScalar(THREE.MathUtils.lerp(modelRoot.scale.x, 1, alpha));
+}
+
 const ZONE_COLORS = {
   stage: "#4f2744",
   workshop: "#453329",
   lounge: "#2f2f4f",
-  gallery: "#3f2b52",
+  gallery: "#244f3a",
   walkway: "#2f2144",
   default: "#3b2c4f"
 };
@@ -621,7 +751,8 @@ const ZONE_COLORS = {
 const MINI_GAME_LABELS = {
   emote_echo_circle: "Echo",
   prop_relay_bench: "Relay",
-  glow_trail_walk: "Trail"
+  glow_trail_walk: "Trail",
+  gallery_golf_putt: "Gallery Golf"
 };
 
 function getZoneCenter(zone, world) {
@@ -672,6 +803,88 @@ function ZonePulseMarker({ world, zone, active, color }) {
         <sphereGeometry args={[0.04, 10, 10]} />
         <meshStandardMaterial color={active ? "#ffe5bc" : "#cbc2dd"} emissive={color} emissiveIntensity={0.45} />
       </mesh>
+    </group>
+  );
+}
+
+function GolfGallerySet({ world, zone, gameState }) {
+  const bounds = zone.bounds || {};
+  const teePoint = {
+    x: Number(bounds.xMin || world.w * 0.62) + 200,
+    y: Number(bounds.yMax || world.h * 0.88) - 250
+  };
+  const holePoint = {
+    x: Number(bounds.xMax || world.w * 0.9) - 240,
+    y: Number(bounds.yMin || world.h * 0.56) + 140
+  };
+  const center = getZoneCenter(zone, world);
+  const sceneCenter = worldToScenePosition(world, center.x, center.y);
+  const sceneTee = worldToScenePosition(world, teePoint.x, teePoint.y);
+  const sceneHole = worldToScenePosition(world, holePoint.x, holePoint.y);
+  const fairwayLength = Math.max(0.1, Math.hypot(sceneHole.x - sceneTee.x, sceneHole.z - sceneTee.z));
+  const fairwayHeading = Math.atan2(sceneHole.z - sceneTee.z, sceneHole.x - sceneTee.x);
+  const ballProgress = clamp(Number(gameState?.ballProgress || 0), 0, 1);
+  const ballWorld = {
+    x: teePoint.x + (holePoint.x - teePoint.x) * ballProgress,
+    y: teePoint.y + (holePoint.y - teePoint.y) * ballProgress
+  };
+  const ballScene = worldToScenePosition(world, ballWorld.x, ballWorld.y);
+  const showCelebration = gameState?.phase === "cooldown";
+
+  return (
+    <group>
+      <mesh position={[sceneCenter.x, 0.035, sceneCenter.z]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
+        <circleGeometry args={[1.9, 36]} />
+        <meshStandardMaterial color="#1a4e39" emissive="#18382a" emissiveIntensity={0.22} roughness={0.88} />
+      </mesh>
+
+      <mesh
+        position={[(sceneTee.x + sceneHole.x) * 0.5, 0.045, (sceneTee.z + sceneHole.z) * 0.5]}
+        rotation={[-Math.PI / 2, 0, fairwayHeading]}
+        receiveShadow
+      >
+        <planeGeometry args={[fairwayLength, 0.28]} />
+        <meshStandardMaterial color="#478b4d" emissive="#264a2a" emissiveIntensity={0.12} roughness={0.9} />
+      </mesh>
+
+      {showCelebration ? (
+        <mesh position={[sceneHole.x, 0.12, sceneHole.z]} rotation={[-Math.PI / 2, 0, 0]}>
+          <ringGeometry args={[0.16, 0.24, 24]} />
+          <meshBasicMaterial color="#ffd79f" transparent opacity={0.88} />
+        </mesh>
+      ) : null}
+
+      <mesh position={[sceneHole.x, 0.05, sceneHole.z]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[0.055, 0.085, 20]} />
+        <meshBasicMaterial color="#fff4d2" transparent opacity={0.85} />
+      </mesh>
+
+      <StaticPropModel url={GOLF_MODEL_URLS.green} position={[sceneCenter.x, 0.02, sceneCenter.z]} scale={0.32} receiveShadow />
+      <StaticPropModel url={GOLF_MODEL_URLS.flag} position={[sceneHole.x, 0.02, sceneHole.z]} scale={0.36} castShadow />
+      <StaticPropModel url={GOLF_MODEL_URLS.tee} position={[sceneTee.x, 0.02, sceneTee.z]} scale={0.16} castShadow={false} />
+      <StaticPropModel url={GOLF_MODEL_URLS.ball} position={[ballScene.x, 0.05, ballScene.z]} scale={0.16} castShadow receiveShadow />
+      <mesh position={[ballScene.x, 0.085, ballScene.z]} castShadow>
+        <sphereGeometry args={[0.055, 16, 16]} />
+        <meshStandardMaterial color="#fff7e8" emissive="#ffe4a8" emissiveIntensity={0.28} />
+      </mesh>
+      <StaticPropModel
+        url={GOLF_MODEL_URLS.putter}
+        position={[sceneTee.x - 0.34, 0.06, sceneTee.z + 0.22]}
+        rotation={[0, Math.PI * 0.12, Math.PI * 0.5]}
+        scale={0.085}
+      />
+      <StaticPropModel
+        url={GOLF_MODEL_URLS.driver}
+        position={[sceneTee.x - 0.2, 0.06, sceneTee.z + 0.38]}
+        rotation={[0, Math.PI * 0.08, Math.PI * 0.5]}
+        scale={0.085}
+      />
+      <StaticPropModel
+        url={GOLF_MODEL_URLS.cart}
+        position={[sceneCenter.x + 1.16, 0.02, sceneCenter.z + 0.58]}
+        rotation={[0, -Math.PI * 0.62, 0]}
+        scale={0.4}
+      />
     </group>
   );
 }
@@ -728,6 +941,7 @@ function StudioEnvironment({ world, zones, miniGames, lightingPreset }) {
                 <meshBasicMaterial color="#f8d0a7" transparent opacity={active ? 0.32 : 0.14} />
               </mesh>
               <ZonePulseMarker world={world} zone={zone} active={active} color={zoneColor} />
+              {zone.id === "gallery" ? <GolfGallerySet world={world} zone={zone} gameState={activeGame} /> : null}
             </group>
           );
         }
@@ -1009,29 +1223,31 @@ function AvatarEntity({ id, isLocal, avatarId, avatarUrl, playersRef, worldRef }
     }
 
     const desiredAnimation = resolveDesiredAnimation(player);
+    const desiredRigAction = actionsRef.current[desiredAnimation];
+    const proceduralMode = !desiredRigAction;
+
     if (desiredAnimation !== activeAnimationRef.current) {
       const previousAction = actionsRef.current[activeAnimationRef.current];
-      const nextAction = actionsRef.current[desiredAnimation] || actionsRef.current.idle;
-
       if (previousAction) {
         previousAction.fadeOut(0.14);
       }
 
-      if (nextAction) {
-        nextAction.reset();
-        nextAction.fadeIn(0.14);
-        nextAction.play();
+      if (desiredRigAction) {
+        desiredRigAction.reset();
+        desiredRigAction.fadeIn(0.14);
+        desiredRigAction.play();
+      } else if (mixerRef.current) {
+        // Avoid procedural-vs-mixer transform conflict on procedural-only states.
+        mixerRef.current.stopAllAction();
       }
 
       activeAnimationRef.current = desiredAnimation;
     }
 
-    if (mixerRef.current) {
+    if (mixerRef.current && !proceduralMode) {
       mixerRef.current.update(delta);
-    }
-
-    const hasRigClipForDesired = Boolean(actionsRef.current[desiredAnimation]);
-    if (!mixerRef.current || !hasRigClipForDesired) {
+      relaxProceduralPose(modelRootRef.current, delta * 12);
+    } else {
       applyProceduralPose(modelRootRef.current, desiredAnimation, speed, performance.now() / 1000, delta * 12);
     }
 
@@ -1388,6 +1604,9 @@ function normalizeMiniGameState(input) {
     cycle: Number.isFinite(input?.cycle) ? input.cycle : 1,
     waypointIndex: Number.isFinite(input?.waypointIndex) ? input.waypointIndex : 0,
     requiresHappywalk: Boolean(input?.requiresHappywalk),
+    sinkCount: Number.isFinite(input?.sinkCount) ? input.sinkCount : 0,
+    shotCount: Number.isFinite(input?.shotCount) ? input.shotCount : 0,
+    ballProgress: Number.isFinite(input?.ballProgress) ? input.ballProgress : 0,
     joined: false,
     lastResult: null
   };
@@ -1428,6 +1647,10 @@ function downgradeLightingPreset(value) {
 }
 
 export default function App() {
+  const [soloCourseMode, setSoloCourseMode] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("solo") === "1" || params.get("mode") === "solo-golf";
+  });
   const [started, setStarted] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     return params.get("autostart") === "1";
@@ -1617,7 +1840,10 @@ export default function App() {
         prompt: state.prompt,
         combo: state.combo,
         progress: Number(state.progress.toFixed?.(3) || state.progress),
-        participants: state.participants
+        participants: state.participants,
+        sinkCount: state.sinkCount || 0,
+        shotCount: state.shotCount || 0,
+        ballProgress: Number(state.ballProgress?.toFixed?.(3) || state.ballProgress || 0)
       })),
       zones: zonesRef.current.map((zone) => ({
         id: zone.id,
@@ -1838,6 +2064,10 @@ export default function App() {
   }, [stepSimulation]);
 
   useEffect(() => {
+    if (soloCourseMode) {
+      return undefined;
+    }
+
     window.render_game_to_text = () => JSON.stringify(refreshRenderState());
 
     window.advanceTime = (ms) => {
@@ -1854,9 +2084,13 @@ export default function App() {
       delete window.render_game_to_text;
       delete window.advanceTime;
     };
-  }, [refreshRenderState]);
+  }, [refreshRenderState, soloCourseMode]);
 
   useEffect(() => {
+    if (soloCourseMode) {
+      return undefined;
+    }
+
     const onKeyDown = (event) => {
       const tagName = event.target?.tagName?.toLowerCase();
       if (tagName === "input" || tagName === "textarea") {
@@ -1880,6 +2114,8 @@ export default function App() {
         if (key === "7") enqueueAction("openlid");
         if (key === "8") enqueueAction("sittingvictory");
         if (key === "9") enqueueAction("happywalk");
+        if (key === "0" || key === "g") enqueueAction("golfshot");
+        if (key === "b") enqueueAction("golfshot");
         if (key === "enter") enqueueAction("wave");
         if (key === " ") enqueueAction("heart");
 
@@ -1911,6 +2147,9 @@ export default function App() {
           "7",
           "8",
           "9",
+          "0",
+          "g",
+          "b",
           "enter",
           " ",
           "f"
@@ -1941,7 +2180,7 @@ export default function App() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [enqueueAction]);
+  }, [enqueueAction, soloCourseMode]);
 
   useEffect(() => {
     startedRef.current = started;
@@ -2488,6 +2727,15 @@ export default function App() {
     confirmCharacterSelection(pendingCharacterId);
   }, [confirmCharacterSelection, pendingCharacterId]);
 
+  const handleEnterSoloCourse = useCallback(() => {
+    setStarted(false);
+    setSoloCourseMode(true);
+  }, []);
+
+  const handleExitSoloCourse = useCallback(() => {
+    setSoloCourseMode(false);
+  }, []);
+
   const handleAuthFieldChange = useCallback((field, value) => {
     setAuthForm((previous) => ({
       ...previous,
@@ -2861,6 +3109,10 @@ export default function App() {
   const handleLightingAutoToggle = useCallback(() => {
     setLightingAuto((previous) => !previous);
   }, []);
+
+  if (soloCourseMode) {
+    return <SoloGolfCourse onExit={handleExitSoloCourse} />;
+  }
 
   return (
     <div style={{ width: "100vw", height: "100vh", position: "relative", background: "#100d17" }}>
@@ -3241,6 +3493,24 @@ export default function App() {
                 >
                   {pendingCharacter ? `Confirm ${pendingCharacter.label}` : "Choose a character first"}
                 </button>
+
+                <button
+                  id="solo-course-btn"
+                  type="button"
+                  onClick={handleEnterSoloCourse}
+                  style={{
+                    border: "1px solid rgba(255, 225, 173, 0.5)",
+                    borderRadius: "999px",
+                    padding: "10px 18px",
+                    fontSize: "0.92rem",
+                    cursor: "pointer",
+                    fontWeight: 700,
+                    color: "#fff3d9",
+                    background: "linear-gradient(135deg, rgba(46, 92, 62, 0.95) 0%, rgba(21, 56, 39, 0.95) 100%)"
+                  }}
+                >
+                  Play Solo Course
+                </button>
               </div>
             </div>
           </div>
@@ -3340,9 +3610,15 @@ export default function App() {
                     {MINI_GAME_LABELS[game.id] || game.id} {game.joined ? "(In Zone)" : ""}
                   </div>
                   <div>
-                    Prompt: {game.prompt || "none"} | Combo: {game.combo} | Progress:{" "}
+                    Prompt: {EMOTE_LABELS[game.prompt] || (game.prompt === "celebrate" ? "Celebrate" : game.prompt || "none")} | Combo:{" "}
+                    {game.combo} | Progress:{" "}
                     {Math.round((Number(game.progress) || 0) * 100)}%
                   </div>
+                  {game.id === "gallery_golf_putt" ? (
+                    <div style={{ opacity: 0.84 }}>
+                      Sinks: {game.sinkCount || 0} | Shots: {game.shotCount || 0}
+                    </div>
+                  ) : null}
                 </div>
               ))
             ) : (

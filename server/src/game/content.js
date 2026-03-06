@@ -33,7 +33,7 @@ export const STUDIO_ZONES = [
     id: "gallery",
     name: "Gallery",
     type: "rect",
-    miniGameId: null,
+    miniGameId: "gallery_golf_putt",
     bounds: { xMin: 1840, xMax: 2760, yMin: 840, yMax: 1700 }
   },
   {
@@ -70,6 +70,23 @@ export const MINI_GAME_DEFS = [
       { streak: 2, stars: 12, xp: 16 },
       { streak: 4, stars: 16, xp: 22 },
       { streak: 6, stars: 20, xp: 28 }
+    ]
+  },
+  {
+    id: "gallery_golf_putt",
+    zoneId: "gallery",
+    type: "precision_putt",
+    shotAction: "golfshot",
+    teePoint: { x: 2040, y: 1450 },
+    holePoint: { x: 2520, y: 980 },
+    teeRadius: 210,
+    successThreshold: 0.96,
+    resetDelayMs: 1600,
+    rewardPerSink: { stars: 18, xp: 24 },
+    rewardMilestones: [
+      { sinks: 3, stars: 22, xp: 30 },
+      { sinks: 6, stars: 28, xp: 36 },
+      { sinks: 10, stars: 34, xp: 44 }
     ]
   },
   {
@@ -117,7 +134,8 @@ export const ALLOWED_EMOTES = new Set([
   "pickup",
   "openlid",
   "sittingvictory",
-  "happywalk"
+  "happywalk",
+  "golfshot"
 ]);
 
 export const QUEST_DEFS = [

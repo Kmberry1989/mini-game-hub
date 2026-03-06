@@ -51,7 +51,26 @@ export class FileBackedStore {
   async init() {
     try {
       const raw = await fs.readFile(this.filePath, "utf-8");
-      const parsed = JSON.parse(raw);
+      const trimmed = String(raw || "").trim();
+      if (!trimmed) {
+        await this.flushNow();
+        return;
+      }
+
+      let parsed = null;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) {
+          throw error;
+        }
+
+        const backupPath = `${this.filePath}.corrupt-${Date.now()}.json`;
+        await fs.writeFile(backupPath, raw, "utf-8").catch(() => {});
+        await this.flushNow();
+        return;
+      }
+
       this.data = {
         ...defaultData(),
         ...parsed,

@@ -26,7 +26,7 @@ export const DEFAULT_ZONE_DEFS = [
     id: "gallery",
     name: "Gallery",
     type: "rect",
-    miniGameId: null,
+    miniGameId: "gallery_golf_putt",
     bounds: { xMin: 1840, xMax: 2760, yMin: 840, yMax: 1700 }
   },
   {
@@ -92,4 +92,3 @@ export function getZoneIdAtPosition(zones, x, y, world = WORLD_DEFAULT) {
 
   return null;
 }
-
