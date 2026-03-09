@@ -35,7 +35,6 @@ import {
   signup,
   updateAvatar
 } from "./game/api";
-import SoloGolfCourse from "./SoloGolfCourse";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:3001";
 const DEFAULT_ROOM_ID = "studio-1";
@@ -765,6 +764,17 @@ function getZoneCenter(zone, world) {
 
   const inset = Number(zone.bounds?.inset || 240);
   return { x: world.w - inset, y: world.h - inset };
+}
+
+function getGalleryGolfEntryPoint(zones, world) {
+  const galleryZone = (Array.isArray(zones) ? zones : []).find((zone) => zone.id === "gallery" && zone.type === "rect");
+  const galleryBounds = galleryZone?.bounds || {};
+  const fallbackX = world.w * 0.7;
+  const fallbackY = world.h * 0.72;
+  return {
+    x: clamp(Number(galleryBounds.xMin || fallbackX) + 220, 40, world.w - 40),
+    y: clamp(Number(galleryBounds.yMax || fallbackY) - 260, 40, world.h - 40)
+  };
 }
 
 function ZoneAccentLight({ position, color, baseIntensity, distance }) {
@@ -1647,10 +1657,10 @@ function downgradeLightingPreset(value) {
 }
 
 export default function App() {
-  const [soloCourseMode, setSoloCourseMode] = useState(() => {
+  const startInGolfFromQuery = useMemo(() => {
     const params = new URLSearchParams(window.location.search);
-    return params.get("solo") === "1" || params.get("mode") === "solo-golf";
-  });
+    return params.get("solo") === "1" || params.get("mode") === "solo-golf" || params.get("golf") === "1";
+  }, []);
   const [started, setStarted] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     return params.get("autostart") === "1";
@@ -1734,6 +1744,7 @@ export default function App() {
   const zonePresenceRef = useRef(zonePresence);
   const miniGameStatesRef = useRef(miniGameStates);
   const fpsSampleRef = useRef({ elapsed: 0, frames: 0, decided: false });
+  const pendingGolfEntryRef = useRef(startInGolfFromQuery);
 
   const refreshPlayerIds = useCallback(() => {
     setPlayerIds(Array.from(playersRef.current.keys()));
@@ -2064,10 +2075,6 @@ export default function App() {
   }, [stepSimulation]);
 
   useEffect(() => {
-    if (soloCourseMode) {
-      return undefined;
-    }
-
     window.render_game_to_text = () => JSON.stringify(refreshRenderState());
 
     window.advanceTime = (ms) => {
@@ -2084,13 +2091,9 @@ export default function App() {
       delete window.render_game_to_text;
       delete window.advanceTime;
     };
-  }, [refreshRenderState, soloCourseMode]);
+  }, [refreshRenderState]);
 
   useEffect(() => {
-    if (soloCourseMode) {
-      return undefined;
-    }
-
     const onKeyDown = (event) => {
       const tagName = event.target?.tagName?.toLowerCase();
       if (tagName === "input" || tagName === "textarea") {
@@ -2180,7 +2183,24 @@ export default function App() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [enqueueAction, soloCourseMode]);
+  }, [enqueueAction]);
+
+  useEffect(() => {
+    if (!started || !pendingGolfEntryRef.current) {
+      return;
+    }
+
+    const self = playersRef.current.get(selfIdRef.current);
+    if (!self) {
+      return;
+    }
+
+    const entryPoint = getGalleryGolfEntryPoint(zonesRef.current, worldRef.current);
+    clickMoveTargetRef.current = entryPoint;
+    setMoveTarget(entryPoint);
+    setMiniGameHint("Routing to Gallery Golf in 3D. Press G/0/B to swing when you arrive.");
+    pendingGolfEntryRef.current = false;
+  }, [selfIdState, started]);
 
   useEffect(() => {
     startedRef.current = started;
@@ -2727,14 +2747,13 @@ export default function App() {
     confirmCharacterSelection(pendingCharacterId);
   }, [confirmCharacterSelection, pendingCharacterId]);
 
-  const handleEnterSoloCourse = useCallback(() => {
-    setStarted(false);
-    setSoloCourseMode(true);
-  }, []);
-
-  const handleExitSoloCourse = useCallback(() => {
-    setSoloCourseMode(false);
-  }, []);
+  const handleStartGolfMode = useCallback(() => {
+    if (!pendingCharacterId) {
+      return;
+    }
+    pendingGolfEntryRef.current = true;
+    confirmCharacterSelection(pendingCharacterId);
+  }, [confirmCharacterSelection, pendingCharacterId]);
 
   const handleAuthFieldChange = useCallback((field, value) => {
     setAuthForm((previous) => ({
@@ -3109,10 +3128,6 @@ export default function App() {
   const handleLightingAutoToggle = useCallback(() => {
     setLightingAuto((previous) => !previous);
   }, []);
-
-  if (soloCourseMode) {
-    return <SoloGolfCourse onExit={handleExitSoloCourse} />;
-  }
 
   return (
     <div style={{ width: "100vw", height: "100vh", position: "relative", background: "#100d17" }}>
@@ -3497,19 +3512,21 @@ export default function App() {
                 <button
                   id="solo-course-btn"
                   type="button"
-                  onClick={handleEnterSoloCourse}
+                  disabled={!pendingCharacter}
+                  onClick={handleStartGolfMode}
                   style={{
                     border: "1px solid rgba(255, 225, 173, 0.5)",
                     borderRadius: "999px",
                     padding: "10px 18px",
                     fontSize: "0.92rem",
-                    cursor: "pointer",
+                    cursor: pendingCharacter ? "pointer" : "not-allowed",
                     fontWeight: 700,
+                    opacity: pendingCharacter ? 1 : 0.62,
                     color: "#fff3d9",
                     background: "linear-gradient(135deg, rgba(46, 92, 62, 0.95) 0%, rgba(21, 56, 39, 0.95) 100%)"
                   }}
                 >
-                  Play Solo Course
+                  Start In Gallery Golf (3D)
                 </button>
               </div>
             </div>

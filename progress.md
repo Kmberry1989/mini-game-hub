@@ -445,3 +445,21 @@ Original prompt: Create a plan to... develop this game further
 ### Notes / TODO
 - Solo mode currently uses stylized 2D course rendering to prioritize playability and deterministic testing speed.
 - Multiplayer golf remains deferred; solo mode is fully local and intentionally server-independent for now.
+
+## 2026-03-08 - Golf solo path unified to 3D avatar experience (in progress)
+- Removed App-level branch that rendered `SoloGolfCourse`; app now always uses the main 3D world runtime.
+- Replaced solo-mode state with a queued golf entry flow (`pendingGolfEntryRef`) that can be triggered by:
+  - query flags: `?solo=1`, `?mode=solo-golf`, or `?golf=1`
+  - start-screen button: `Start In Gallery Golf (3D)`
+- Added gallery entry-point resolver and auto-route behavior: when queued, the player is directed into the gallery golf zone in-world.
+- Kept golf controls/animations in the same emote/action system (`golfshot`) so solo and multiplayer share avatar animation behavior.
+- Validation:
+  - `npm run build` in `client/` passed.
+  - Skill Playwright loop run (`web_game_playwright_client.js`) against `http://localhost:5173/?autostart=1&character=kyle&solo=1` generated artifacts in `/tmp/mini-game-hub-golf-3d`.
+  - Interactive Playwright check confirmed start-screen flow:
+    - select character -> click `Start In Gallery Golf (3D)` -> zone transitions to `Gallery`.
+    - `Golf Shot` action appears in context actions.
+    - immediate post-action state shows `{ selfAnim: "golfshot", selfEmote: "golfshot", zoneId: "gallery" }`.
+  - Screenshot artifact: `/tmp/mini-game-hub-golf-button-flow.png`.
+- Follow-up suggestion:
+  - Remove or repurpose `client/src/SoloGolfCourse.jsx` now that it is no longer wired into `App.jsx`.

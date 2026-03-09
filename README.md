@@ -22,6 +22,11 @@ Server:
 
 ## Install
 
+### Quick start (server + client together)
+cd /path/to/mini-game-hub
+npm install
+npm run dev
+
 ### Server
 cd server
 npm install
