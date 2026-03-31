@@ -563,10 +563,15 @@ function prepareClipForModel(clip, modelRoot) {
     if (property === "quaternion") {
       if (nodeName === ROOT_MOTION_BONE && track.values?.length >= 4) {
         const values = Float32Array.from(track.values);
+        let baseYaw = null;
 
         for (let index = 0; index < values.length; index += 4) {
           quaternion.set(values[index], values[index + 1], values[index + 2], values[index + 3]).normalize();
           euler.setFromQuaternion(quaternion, "YXZ");
+          if (baseYaw === null) {
+            baseYaw = euler.y;
+          }
+          euler.y = baseYaw;
           euler.x = THREE.MathUtils.clamp(euler.x, -MAX_ROOT_TILT_RADIANS, MAX_ROOT_TILT_RADIANS);
           euler.z = THREE.MathUtils.clamp(euler.z, -MAX_ROOT_TILT_RADIANS, MAX_ROOT_TILT_RADIANS);
           quaternion.setFromEuler(euler).normalize();
@@ -587,11 +592,10 @@ function prepareClipForModel(clip, modelRoot) {
 
     if (property === "position" && nodeName === ROOT_MOTION_BONE && track.values?.length >= 3) {
       const values = Float32Array.from(track.values);
-      const baseY = values[1];
 
       for (let index = 0; index < values.length; index += 3) {
         values[index] = 0;
-        values[index + 1] -= baseY;
+        values[index + 1] = 0;
         values[index + 2] = 0;
       }
 
@@ -1239,12 +1243,18 @@ function AvatarEntity({ id, isLocal, avatarId, avatarUrl, playersRef, worldRef }
     if (desiredAnimation !== activeAnimationRef.current) {
       const previousAction = actionsRef.current[activeAnimationRef.current];
       if (previousAction) {
-        previousAction.fadeOut(0.14);
+        previousAction.stop();
       }
 
       if (desiredRigAction) {
+        if (mixerRef.current) {
+          // Retargeted FBX clips do not blend cleanly across this avatar roster.
+          mixerRef.current.stopAllAction();
+        }
         desiredRigAction.reset();
-        desiredRigAction.fadeIn(0.14);
+        desiredRigAction.enabled = true;
+        desiredRigAction.setEffectiveWeight(1);
+        desiredRigAction.setEffectiveTimeScale(1);
         desiredRigAction.play();
       } else if (mixerRef.current) {
         // Avoid procedural-vs-mixer transform conflict on procedural-only states.

@@ -416,7 +416,24 @@ Original prompt: Create a plan to... develop this game further
   - `/tmp/mini-game-hub-golf6` confirmed golf shot trigger (`shotCount: 1`, `ballProgress: 0.358`).
   - `/tmp/mini-game-hub-golf7` confirmed repeated shots (`shotCount: 5`, `ballProgress: 0.928`) and ball indicator progression.
   - `/tmp/mini-game-hub-golf8` confirmed sink/cooldown transition (`phase: cooldown`, `sinkCount: 1`, `shotCount: 6`, `ballProgress: 1`).
-  - No `errors-*.json` generated in the latest runs above.
+- No `errors-*.json` generated in the latest runs above.
+
+## 2026-03-31 - Avatar twist / lift stabilization
+- Tightened rig-clip sanitization in `client/src/App.jsx`:
+  - root hips yaw now stays locked to the clip's starting facing instead of inheriting per-frame twist from the FBX track
+  - root hips translation is fully zeroed so avatar clips no longer lift the whole model off the floor
+- Changed runtime rig transitions to hard cuts (`stopAllAction()` + reset/play) instead of FBX cross-fades, which were producing awkward blended poses on the current avatar roster.
+
+### Verification
+- Client build passes: `npm run build:client`.
+- Playwright skill capture for wave emote: `/tmp/mini-game-hub-twist-check-wave-3`
+  - `state-0.json` / `state-1.json` keep `self.anim = "wave"` with no console error artifacts.
+  - `shot-0.png` / `shot-1.png` show the avatar staying grounded during the wave clip instead of floating upward.
+- Additional stability capture: `/tmp/mini-game-hub-twist-check-move-3`
+  - screenshot frames show the idle pose remaining upright and grounded after the rig transition changes.
+
+### Remaining follow-up
+- The current automated movement burst did not reliably trigger a visible `walk` state in headless capture, so locomotion still needs a focused manual or scripted pass with a guaranteed movement/focus path.
 
 ### Notes / TODO
 - Current golf props are intentionally stylized and lightweight; if stricter realism is desired, tune GLB placement/scale and course layout positions.
